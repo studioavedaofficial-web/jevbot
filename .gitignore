@@ -1,0 +1,25 @@
+# runtime state
+data/*.db
+data/*.db-journal
+data/store/
+data/runs/
+*.log
+
+# generated demo market data (regenerate with scripts/gen_data.py)
+data/demo/*.jsonl
+data/demo/*.json
+
+# secrets
+.env
+.env.local
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/

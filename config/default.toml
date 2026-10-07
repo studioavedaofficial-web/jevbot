@@ -1,0 +1,130 @@
+# Jevbot default configuration.
+# Override with a second file: `--config my.toml` (merged, later files win).
+# Environment variables (JEVBOT_*) override the file for the few keys listed
+# in jevbot/config.py; everything here is also settable per-run on the CLI.
+
+[engine]
+# auto | laya | heuristic
+name = "auto"
+laya_repo = "convaiinnovations/laya"
+device = ""              # "" = let Laya choose; or cuda / mps / cpu
+preload = false          # true keeps every checkpoint resident (serve mode)
+# Answers below this answer_confidence are treated as abstentions by the risk
+# engine. Empty = gate off. NOTE: Laya's shipped checkpoints are over-confident
+# as shipped; fit a threshold on your own held-out data (scripts/eval_engine.py)
+# before treating a number here as meaningful.
+min_confidence = 0.0
+# Cache decisions by (state hash, question schema hash) so replays are free.
+cache = true
+
+[risk]
+starting_equity = 100000.0
+max_weight_per_symbol = 0.35    # fraction of equity in one symbol
+max_gross_weight = 1.00         # sum of |weights|
+max_net_weight = 0.80           # sum of signed weights
+max_positions = 8               # open symbols at once
+max_trades_per_cycle = 4
+daily_loss_limit_pct = 0.03     # halt trading for the rest of the UTC day
+max_drawdown_pct = 0.20         # halt everything (kill switch)
+min_cash_buffer = 0.02          # keep this fraction of equity in cash
+stale_data_seconds = 900        # no trade on a snapshot older than this
+# The smallest position worth *managing*. A $30 position in a 100k account
+# cannot pay for its own monitoring: the round trip costs the same whether the
+# ticket is large or small, so tickets below this are not opened (closing a
+# position is always allowed — refusing to close is a risk decision, and the
+# risk engine is the only place allowed to make those).
+min_order_notional = 500.0
+cooldown_seconds_after_stop = 1800
+vol_target_annual = 0.30        # portfolio vol target used by the sizer
+vol_floor_annual = 0.08         # never size as if volatility were below this
+max_turnover_per_cycle = 0.25   # gross notional / equity traded per cycle
+
+[signals]
+# Weights of the typed Laya answers when they are fused into one signed score.
+w_direction = 1.00          # sign carrier
+w_conviction = 0.65         # 0..1 from the `conviction` score question
+w_materiality = 0.75        # P(tradeable) from the `materiality` noul
+w_context = 0.45            # 0..1 from the `context_aligned` noul
+w_priced_in = 0.55          # discount for news the market already reflects
+w_risk_event = 0.70         # haircut from the `risk_event` noul
+base = 0.20                 # floor so a high-conviction news item is not zeroed
+horizon = { intraday = 0.60, swing = 0.85, positional = 1.0 }
+# How fast a headline's signal decays, per horizon (seconds to halve).
+# Deliberately a little slower than the market's own impulse: a signal that
+# decays faster than the move it predicts exits before the move finishes and
+# pays the round trip for nothing.
+decay_half_life = { intraday = 10800, swing = 43200, positional = 259200 }
+# Aggregate a symbol's live signals by exponential decay before sizing.
+aggregation = "decay_sum"     # decay_sum | max | mean
+# How often an already-decided headline is re-read in an updated market context.
+# Re-reading it every cycle makes the target weight jitter with no new
+# information, and the jitter is paid for in spread.
+refresh_seconds = 3600
+min_materiality = 0.30
+clip = 1.0
+
+[broker]
+kind = "paper"             # paper | ccxt | alpaca
+# Smallest change of opinion worth paying for. Two bands, whichever is larger:
+# `rebalance_tolerance` as a fraction of equity, and
+# `rebalance_tolerance_relative` as a fraction of the position itself — so a
+# large position is not rebalanced in increments it barely notices, and a small
+# one is not nibbled to death. Separate from min_order_notional, which only
+# keeps uneconomic tickets off the venue.
+rebalance_tolerance = 0.015
+rebalance_tolerance_relative = 0.25
+fee_bps = 5.0              # taker fee, basis points
+slippage_bps = 3.0
+half_spread_bps = 1.5
+allow_fractional = true
+lot_step = 0.000001        # crypto-style precision; equities get 1 share
+
+[loop]
+cycle_seconds = 5.0        # how often the bot wakes up
+news_poll_seconds = 5.0
+bar_seconds = 60           # feed resolution for the synthetic / live tape
+
+[universe]
+# `market` picks the adapter family; `symbol` is what the strategy sees.
+[[universe.instruments]]
+symbol = "BTC/USDT"
+market = "crypto"
+name = "Bitcoin"
+
+[[universe.instruments]]
+symbol = "ETH/USDT"
+market = "crypto"
+name = "Ethereum"
+
+[[universe.instruments]]
+symbol = "AAPL"
+market = "equity"
+name = "Apple"
+
+[[universe.instruments]]
+symbol = "NVDA"
+market = "equity"
+name = "NVIDIA"
+
+[[universe.instruments]]
+symbol = "SPY"
+market = "equity"
+name = "S&P 500 ETF"
+
+[demo]
+# The offline demo market. `seed` makes runs bit-reproducible, and the whole
+# price path is a pure function of (seed, these settings) — only the generated
+# headlines are ever written to disk.
+seed = 7
+days = 30
+# Total price effect of a headline at full magnitude. Lowering this toward zero
+# is the honest stress test: the strategy should stop making money as the
+# news-to-noise ratio falls, and if it does not, it is trading something else.
+# Sized so that a perfect reader of the text beats the noise — a testbed where
+# even the oracle is at coin-flip cannot tell a good engine from a broken one.
+impact_scale = 0.05
+# Share of headlines whose text is indistinguishable in kind from a real one but
+# which leave the tape untouched. This is what stops a lexicon from being right
+# for free, and it is the honest hard case rather than an adversarial one.
+noise_share = 0.25
+headlines_per_day = 30

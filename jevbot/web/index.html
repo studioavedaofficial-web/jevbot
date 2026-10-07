@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Jevbot — Laya decision engine dashboard</title>
+<link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="mark">JEVBOT</span>
+    <span class="sub">news-driven algo bot · Laya system-1 decisions</span>
+  </div>
+  <div class="badges" id="badges"></div>
+  <div class="clock" id="clock">—</div>
+  <div class="controls">
+    <button data-action="pause" id="btn-pause">Pause</button>
+    <button data-action="flatten" class="warn">Flatten</button>
+    <button data-action="reset_kill">Reset kill</button>
+    <button data-action="stop" class="danger">Stop</button>
+  </div>
+</header>
+
+<div class="warnbar hidden" id="warnbar"></div>
+
+<section class="kpis" id="kpis"></section>
+
+<main class="grid">
+  <section class="panel wide">
+    <h2>Equity <span class="hint" id="equity-hint"></span></h2>
+    <div id="chart" class="chart"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Risk governor</h2>
+    <div id="risk"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Signals <span class="hint">fused, sized</span></h2>
+    <div id="signals"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Positions</h2>
+    <div id="positions"></div>
+  </section>
+
+  <section class="panel wide">
+    <h2>Decisions <span class="hint">one row per (headline, instrument) — the engine's typed answers</span></h2>
+    <div id="decisions"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Engine <span class="hint" id="engine-hint"></span></h2>
+    <div id="engine"></div>
+  </section>
+
+  <section class="panel">
+    <h2>News <span class="hint">with routing</span></h2>
+    <div id="news"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Orders &amp; fills</h2>
+    <div id="orders"></div>
+  </section>
+
+  <section class="panel wide">
+    <h2>Event log</h2>
+    <div id="events"></div>
+  </section>
+</main>
+
+<footer class="foot">
+  <span id="foot-note">
+    Values are computed from the recorded state of <em>this</em> run. A synthetic price feed is a
+    plumbing test, not evidence of edge — check the feed badge before reading anything into P&amp;L.
+  </span>
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

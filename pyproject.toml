@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jevbot"
+version = "0.1.0"
+description = "News-driven algorithmic trading bot whose signal engine is Laya's typed System 1 decisions"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "studioavedaofficial-web" }]
+keywords = ["trading", "algorithmic-trading", "laya", "nlp", "system-1", "backtest"]
+
+# The core bot, its risk engine, the paper broker, the backtester and the
+# dashboard run on the standard library alone. Everything else is opt-in:
+#  - laya     : the real decision engine (the whole point); without it the bot
+#               runs the deterministic fallback engine so the pipeline is still
+#               exercisable end to end.
+#  - ccxt     : crypto exchange adapters (live + historical data).
+#  - alpaca   : US equity adapters (live + historical data).
+dependencies = []
+
+[project.optional-dependencies]
+engine = ["laya>=0.4.0"]
+crypto = ["ccxt>=4.2"]
+equities = ["alpaca-py>=0.20"]
+dev = ["pytest>=7.4", "ruff>=0.4"]
+all = ["laya>=0.4.0", "ccxt>=4.2", "alpaca-py>=0.20"]
+
+[project.scripts]
+jevbot = "jevbot.cli:main"
+
+[tool.setuptools]
+packages = ["jevbot", "jevbot.engine", "jevbot.feeds", "jevbot.brokers"]
+
+[tool.setuptools.package-data]
+jevbot = ["web/*.html", "web/*.js", "web/*.css"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

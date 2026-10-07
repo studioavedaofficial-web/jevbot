@@ -517,6 +517,12 @@ class TradingBot:
         pw = self.portfolio.weights()
         return {
             "cycle": self.cycle_count,
+            # The operator's flags belong in the payload the dashboard reads:
+            # a page that tracks "paused" in its own memory shows the wrong
+            # state after a refresh, and offers the wrong button.
+            "paused": self.paused,
+            "stop_requested": self.stop_requested,
+            "flatten_requested": self.flatten_requested,
             "now": self.now(),
             "engine": engine_summary(self.engine),
             "broker": self.broker.info() if hasattr(self.broker, "info") else {},

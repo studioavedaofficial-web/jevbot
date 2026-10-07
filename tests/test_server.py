@@ -103,8 +103,12 @@ def test_control_endpoints_actually_move_the_bot(served):
     base, bot = served
     assert post(base + "/api/control/pause")["ok"] is True
     assert bot.paused is True
+    assert get(base + "/api/state")["bot"]["paused"] is True, (
+        "the dashboard has to be able to see that it is paused, or its button lies"
+    )
     assert post(base + "/api/control/resume")["ok"] is True
     assert bot.paused is False
+    assert get(base + "/api/state")["bot"]["paused"] is False
     assert post(base + "/api/control/stop")["ok"] is True
     assert bot.stop_requested is True
     # a stopped bot refuses to run more cycles, which is the whole point

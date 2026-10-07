@@ -100,8 +100,15 @@ function renderHeader() {
   if (feed.synthetic) badges.push(`<span class="badge synth">synthetic market</span>`);
   if (risk.killed) badges.push(`<span class="badge killed">kill switch</span>`);
   if (risk.halted_today) badges.push(`<span class="badge killed">halted today</span>`);
-  if (state.paused) badges.push(`<span class="badge fallback">paused</span>`);
+  if (bot.paused) badges.push(`<span class="badge fallback">paused</span>`);
+  if (bot.stop_requested) badges.push(`<span class="badge killed">stopping</span>`);
   el('badges').innerHTML = badges.join('');
+
+  const pauseBtn = document.querySelector('[data-action="pause"], [data-action="resume"]');
+  if (pauseBtn) {
+    pauseBtn.dataset.action = bot.paused ? 'resume' : 'pause';
+    pauseBtn.textContent = bot.paused ? 'Resume' : 'Pause';
+  }
 
   const simClock = feed.sim_now_utc ? `sim ${fmt.time(feed.sim_now)}` : fmt.time(bot.now);
   el('clock').innerHTML = `${fmt.esc(simClock)} UTC<br/>cycle ${fmt.int(bot.cycle)} · up ${fmt.int(a.server?.uptime_seconds)}s`;
@@ -387,7 +394,6 @@ document.querySelectorAll('[data-action]').forEach(b => {
     if (action === 'flatten' && !confirm('Close every position at the next cycle and stop trading?')) return;
     const res = await post(`/api/control/${action}`);
     if (!res.ok) alert(res.error || 'action failed');
-    state.paused = action === 'pause' ? true : action === 'resume' ? false : state.paused;
     poll();
   });
 });

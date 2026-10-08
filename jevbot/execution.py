@@ -47,6 +47,7 @@ def plan_orders(
     snapshots: dict[str, MarketSnapshot],
     *,
     min_order_notional: float = 25.0,
+    max_order_notional: float = 0.0,
     max_trades: int = 4,
     lot_step: float = 1e-6,
     allow_fractional: bool = True,
@@ -132,6 +133,21 @@ def plan_orders(
                 qty = abs(min(current_qty, 0.0))
                 if qty <= 0:
                     continue
+        # Per-order size cap. Exits are exempt by design: clipping a close
+        # leaves dust, and dust re-arms a close on every cycle forever. A ticket
+        # that adds exposure is the one a fat finger or a bad weight can inflate.
+        capped_by = 0.0
+        increases = (current_qty >= 0) if side is Side.BUY else (current_qty < 0)
+        if max_order_notional > 0 and not closing and increases:
+            cap_qty = quote_to_base(max_order_notional, price, step, allow_fractional)
+            if qty > cap_qty:
+                capped_by = (qty - cap_qty) * price
+                qty = cap_qty
+                # A capped ticket that no longer clears the minimum is not worth
+                # the venue's time; the next cycle can decide again.
+                if qty * price < min_order_notional:
+                    continue
+
         order = Order(
             symbol=symbol,
             side=side,
@@ -140,6 +156,7 @@ def plan_orders(
             reason=reason or ("close" if closing else "rebalance"),
             ts=ts if ts is not None else time.time(),
         )
+        order.notes = f"capped by {capped_by:,.2f} at {max_order_notional:,.2f}/order" if capped_by else ""
         is_exit = abs(target_notional) < abs(current_notional)
         candidates.append((abs(delta), order, is_exit))
 

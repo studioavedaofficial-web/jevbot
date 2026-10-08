@@ -151,6 +151,10 @@ class TradingBot:
         self._risk_events_recorded = 0
         self._cycle_error = ""
         self._cycles_since_error = 0
+        # Venue breaker: set when the exchange rejects orders repeatedly.
+        self._consecutive_rejections = 0
+        self.venue_stopped = False
+        self.venue_stop_reason = ""
         self.events: list[dict[str, Any]] = []
         self.latest_snapshots: dict[str, MarketSnapshot] = {}
         self.latest_signals: dict[str, Signal] = {}
@@ -264,6 +268,17 @@ class TradingBot:
                 self._log("risk-drop", f"{symbol}: {reason}")
 
         # 7 ── execute
+        if self.venue_stopped:
+            # Hold the book exactly as it is. Flattening here would be the worst
+            # possible response: the venue is refusing orders, so the exit would
+            # be refused too, and the bot would report a flat account it does not
+            # have. Stop adding exposure, say why, and wait for a human.
+            result.notes = [*result.notes, f"venue breaker: {self.venue_stop_reason}"]
+            self._record(now, signals, [])
+            self.cycle_count += 1
+            self._last_cycle_ts = now
+            result.equity = self.portfolio.equity()
+            return result
         if verdict.flatten:
             orders = flatten_orders(self.portfolio, ts=now)
             orders += close_orders(self.portfolio, [s for s, _ in stopped], ts=now)
@@ -275,6 +290,7 @@ class TradingBot:
                 approved,
                 snapshots,
                 min_order_notional=self.risk.limits.min_order_notional,
+                max_order_notional=self.risk.limits.max_order_notional,
                 max_trades=self.risk.limits.max_trades_per_cycle,
                 lot_step=float(cfg.get("broker", "lot_step", default=1e-6)),
                 allow_fractional=bool(cfg.get("broker", "allow_fractional", default=True)),
@@ -370,23 +386,64 @@ class TradingBot:
                ts: float | None = None) -> list[Any]:
         fills: list[Any] = []
         statuses: list[tuple[Order, str, str]] = []
+        orders = list(orders)
+        if self.venue_stopped and orders:
+            # The single choke point. The cycle loop already declines to plan
+            # orders while the breaker is on; this makes it impossible for any
+            # other caller to put one on the wire by another path. An order that
+            # was never sent is recorded as blocked, not as rejected — the two
+            # look identical in a venue's error log and completely different in
+            # an audit.
+            for order in orders:
+                statuses.append((order, "blocked", f"venue breaker: {self.venue_stop_reason}"))
+            if self.store:
+                self.store.record_orders(statuses)
+            return fills
         for order in orders:
             try:
                 fill = self.broker.submit(order, snapshots.get(order.symbol), ts)
             except Exception as exc:
+                self._note_rejection(order, exc)
                 self._log("error", f"order failed for {order.symbol}: {exc}")
                 statuses.append((order, "rejected", str(exc)))
                 continue
+            self._consecutive_rejections = 0
+            note = (order.notes + " · ") if getattr(order, "notes", "") else ""
             if fill is not None:
                 fills.append(fill)
-                statuses.append((order, "filled", f"@ {fill.price:.4f} fee {fill.fee:.4f}"))
+                statuses.append((order, "filled", f"{note}@ {fill.price:.4f} fee {fill.fee:.4f}"))
             else:
-                statuses.append((order, "accepted", "no immediate fill"))
+                statuses.append((order, "accepted", f"{note}no immediate fill"))
         if self.store and statuses:
             self.store.record_orders(statuses)
             if fills:
                 self.store.record_fills(fills)
         return fills
+
+    def _note_rejection(self, order: Order, exc: Exception) -> None:
+        """Count rejections in a row and stop talking to a venue that keeps saying no."""
+        self._consecutive_rejections += 1
+        limit = int(self.risk.limits.max_consecutive_rejections or 0)
+        if limit <= 0 or self._consecutive_rejections < limit or self.venue_stopped:
+            return
+        self.venue_stopped = True
+        self.venue_stop_reason = (
+            f"{self._consecutive_rejections} consecutive venue rejections "
+            f"(last: {order.symbol}: {exc})"
+        )
+        log.error("VENUE BREAKER: %s", self.venue_stop_reason)
+        self._log("risk", f"venue breaker tripped — {self.venue_stop_reason}")
+        self._log("risk", "no further orders will be sent; fix the cause, then "
+                          "reset the breaker from the dashboard")
+
+    def reset_venue_breaker(self) -> None:
+        """Clear the breaker. Deliberately an operator action, never automatic."""
+        was = self.venue_stopped
+        self.venue_stopped = False
+        self.venue_stop_reason = ""
+        self._consecutive_rejections = 0
+        if was:
+            self._log("risk", "venue breaker reset by the operator")
 
     def _record(self, now: float, signals: dict[str, Signal], fills: list[Any]) -> None:
         prices = {s: snap.last for s, snap in self.latest_snapshots.items()}
@@ -452,11 +509,48 @@ class TradingBot:
 
     # ── running ────────────────────────────────────────────────────────────
 
+    def _adopt_venue_balance(self) -> None:
+        """Make the local book match the account the orders will hit.
+
+        Sizing is a function of equity, so a bot that thinks it has $100,000
+        while the sandbox account holds $1,000 will size every ticket ten times
+        too large and spend its first cycle collecting rejections. The venue is
+        the source of truth about the venue's account; adopt it, and re-anchor
+        the governor so the new size is not read as a catastrophic drawdown.
+        """
+        equity_fn = getattr(self.broker, "equity", None)
+        if self.broker.name == "paper" or not callable(equity_fn):
+            return
+        try:
+            cash, holdings = equity_fn()
+        except Exception as exc:  # noqa: BLE001 - a broker that cannot be read is not a crash
+            log.warning("could not read the venue balance: %s", exc)
+            self._log("error", f"could not read the venue balance: {exc}")
+            return
+        if cash <= 0 and not holdings:
+            self._log(
+                "error",
+                "the venue account is empty — fund it from the testnet faucet before "
+                "routing orders to it; the local book is unchanged",
+            )
+            return
+        held = ", ".join(f"{v:g} {k}" for k, v in holdings.items() if v) or "nothing else"
+        self.portfolio.cash = cash
+        equity = self.portfolio.equity()
+        self.risk.anchor_equity(equity, reason="venue balance adopted at startup")
+        self._log(
+            "boot",
+            f"venue account adopted: {cash:,.2f} cash, holding {held} — "
+            f"sizing from {equity:,.2f}, not the configured "
+            f"{self.risk.limits.starting_equity:,.2f}",
+        )
+
     def warmup(self) -> None:
         """Prime the feeds and say, once, what the bot is about to do."""
         prime = getattr(self.price_feed, "prime", None)
         if callable(prime):
             prime()
+        self._adopt_venue_balance()
         if self.store:
             self.store.record_engine_info(engine_summary(self.engine))
         self._log(
@@ -551,6 +645,9 @@ class TradingBot:
             "paused": self.paused,
             "stop_requested": self.stop_requested,
             "flatten_requested": self.flatten_requested,
+            "venue_stopped": self.venue_stopped,
+            "venue_stop_reason": self.venue_stop_reason,
+            "consecutive_rejections": self._consecutive_rejections,
             "now": self.now(),
             "engine": engine_summary(self.engine),
             "broker": self.broker.info() if hasattr(self.broker, "info") else {},

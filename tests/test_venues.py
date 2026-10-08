@@ -154,15 +154,17 @@ def test_config_selects_testnet_for_both_the_feed_and_the_broker(fake):
     assert feed.info()["testnet"] is True
     assert feed.info()["endpoint"] == fake_ccxt.TESTNET
 
-    # the shipped profile routes orders nowhere: paper fills, testnet prices
-    paper = build_broker(cfg, Portfolio.fresh(1_000.0))
-    assert paper.name == "paper" and paper.is_live is False
-
-    cfg.raw["broker"]["kind"] = "ccxt"
+    # the shipped profile routes orders to the sandbox venue itself: real order
+    # flow against fake money, which is what step 1 asks for.
     broker = build_broker(cfg, Portfolio.fresh(1_000.0))
+    assert broker.name == "ccxt", "the testnet profile places real testnet orders"
     assert broker.info()["testnet"] is True
     assert broker.is_live is False
     assert broker.info()["endpoint"] == fake_ccxt.TESTNET
+
+    # and --mode paper still keeps every order local without touching the config
+    forced = build_broker(cfg, Portfolio.fresh(1_000.0), force_paper=True)
+    assert forced.name == "paper" and forced.is_live is False
 
 
 def test_a_testnet_run_can_never_be_live(fake):
@@ -287,3 +289,17 @@ def test_a_dead_rss_source_does_not_take_the_bot_down(fake):
     """News is a nicety; a news outage must not stop a position being closed."""
     feed = RSSNewsFeed(["https://unreachable.invalid/feed.xml"], timeout=0.5)
     assert feed.poll() == []
+
+
+def test_a_loopback_endpoint_is_not_a_real_exchange():
+    """The smoke-order guard: a local server is not a way to reach real money."""
+    from jevbot.venues import is_local_endpoint, is_testnet_endpoint
+
+    assert is_local_endpoint("http://127.0.0.1:8000/api/v3") is True
+    assert is_local_endpoint("http://localhost:8000/api/v3") is True
+    assert is_local_endpoint("https://api.binance.com/api/v3") is False
+    assert is_local_endpoint("https://api.binance.com/api/v3") is False
+    # and the two predicates together are what the CLI requires
+    assert is_testnet_endpoint("https://testnet.binance.vision/api/v3") is True
+    assert (is_testnet_endpoint("https://api.binance.com/api/v3")
+            or is_local_endpoint("https://api.binance.com/api/v3")) is False

@@ -34,6 +34,16 @@ stale_data_seconds = 900        # no trade on a snapshot older than this
 # position is always allowed — refusing to close is a risk decision, and the
 # risk engine is the only place allowed to make those).
 min_order_notional = 500.0
+# Largest single order that may *add* exposure. 0 disables the cap, which is
+# the right default for a paper book with no venue to upset. Set it whenever
+# orders go to a real venue: a weight bug that slips through the sizer turns
+# into a very expensive ticket otherwise. Exits are exempt by design — a
+# clipped close leaves dust behind, and dust re-arms a close forever.
+max_order_notional = 0.0
+# Stop sending orders after this many refusals in a row (0 disables). A venue
+# that says no five times is telling you the account, the symbol or the key is
+# wrong. Clearing it is an operator action.
+max_consecutive_rejections = 5
 cooldown_seconds_after_stop = 1800
 vol_target_annual = 0.30        # portfolio vol target used by the sizer
 vol_floor_annual = 0.08         # never size as if volatility were below this

@@ -180,6 +180,7 @@ class Order:
     order_type: str = "market"
     limit_price: float | None = None
     reason: str = ""
+    notes: str = ""          # why the risk layer changed this ticket, if it did
     client_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
 
     def __post_init__(self) -> None:

@@ -114,6 +114,8 @@ class DashboardServer:
                 self.bot.flatten_and_stop_trading()
             elif action == "reset_kill":
                 self.bot.reset_kill_switch()
+            elif action == "reset_breaker":
+                self.bot.reset_venue_breaker()
             elif action == "stop":
                 self.bot.request_stop()
             else:

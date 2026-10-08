@@ -53,6 +53,8 @@ button.danger { color: var(--short); border-color: #4a2626; }
 .badge.live { color: var(--long); border-color: #1d4a31; }
 .badge.paper { color: var(--accent); border-color: #1e3a5c; }
 .badge.synth { color: var(--warn); border-color: #4a3a20; }
+.badge.testnet { color: #ffd479; border-color: #5c4a1e; }
+.badge.venue { color: var(--muted, #8b93a7); border-color: #2b3346; }
 .badge.laya { color: #c58fff; border-color: #3d2a5c; }
 .badge.fallback { color: var(--warn); border-color: #4a3a20; }
 .badge.killed { color: var(--short); border-color: #4a2626; }

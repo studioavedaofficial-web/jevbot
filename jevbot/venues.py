@@ -74,6 +74,24 @@ def build_ccxt_exchange(
     return exchange
 
 
+def is_local_endpoint(url: str) -> bool:
+    """True for a loopback address — a venue that cannot be a real exchange.
+
+    Used by the guard on the one command that places orders: `api.binance.com`
+    must be refused while a server on 127.0.0.1 (the test venue) is obviously
+    not a real account. Without this the guard would be a string match on
+    "testnet", which is fine for Binance and useless for anything else.
+    """
+    try:
+        from urllib.parse import urlparse
+
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:  # pragma: no cover - defensive
+        return False
+    # "localhost" and "127.x" and "[::1]" — the shapes a local venue takes.
+    return host in {"localhost", "::1"} or host.startswith("127.")
+
+
 def rest_endpoint(exchange: Any, *keys: str) -> str:
     """The URL this exchange will actually use for the given API family.
 

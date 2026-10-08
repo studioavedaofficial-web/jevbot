@@ -98,10 +98,15 @@ class CCXTBroker(Broker):
                 self.exchange.load_markets()
                 self.markets_loaded = True
             side = "buy" if order.side is Side.BUY else "sell"
+            # `self.params`, never `self.params or None`: ccxt mutates the dict
+            # it is handed (`params.clear()` on some paths), and None is not a
+            # dict — the very first real order would have died in ccxt's own
+            # plumbing rather than at the venue.
             raw = self.exchange.create_order(
-                order.symbol, "market", side, order.qty, None, self.params or None
+                order.symbol, "market", side, order.qty, None, dict(self.params)
             )
             self.orders_sent += 1
+            self.last_order = raw if isinstance(raw, dict) else None
             return self._to_fill(order, raw, ts)
         except Exception as exc:  # pragma: no cover - network
             self.orders_rejected += 1
@@ -113,11 +118,34 @@ class CCXTBroker(Broker):
             raise BrokerError(f"order rejected for {order.symbol}: {exc}") from exc
 
     def _to_fill(self, order: Order, raw: dict[str, Any], ts: float | None = None) -> Fill | None:
-        filled = float(raw.get("filled") or raw.get("amount") or order.qty)
+        """Book the venue's own numbers, never the ones we asked for.
+
+        ``filled`` and ``average`` come from the exchange's response. Substituting
+        the requested quantity here would make every fill a confirmation of the
+        order rather than a report of what happened — the single most useful
+        thing this class can get wrong.
+        """
+        filled = float(raw.get("filled") or 0.0)
         price = float(raw.get("average") or raw.get("price") or 0.0)
-        if not price or not filled:
-            # the venue accepted but has not printed yet; the reconcile pass
-            # will pick it up on a later cycle
+        if not filled:
+            # Some venues report a market order as closed with the quantity
+            # only on the individual fills; fall back to the last trade's size,
+            # and to the request only as a last resort.
+            trades = raw.get("trades") or raw.get("fills") or []
+            if trades:
+                filled = sum(float(tr.get("amount") or tr.get("qty") or 0.0) for tr in trades)
+                price = price or (
+                    sum(float(tr.get("price") or 0.0) * float(tr.get("amount") or tr.get("qty") or 0.0)
+                        for tr in trades) / filled if filled else 0.0
+                )
+        if not filled:
+            status = str(raw.get("status") or "").lower()
+            if status in {"rejected", "canceled", "cancelled", "expired"}:
+                raise BrokerError(
+                    f"venue reported {status} for {order.symbol}: "
+                    f"{raw.get('info') or raw.get('clientOrderId') or 'no detail'}"
+                )
+            # accepted but nothing printed yet; reconcile picks it up later
             return None
         fee = 0.0
         fee_obj = raw.get("fee") or {}
@@ -155,6 +183,38 @@ class CCXTBroker(Broker):
                         pos.qty = venue_qty
         except Exception as exc:  # pragma: no cover - network
             self.last_error = f"reconcile failed: {exc}"
+
+    # ── the venue's account, not our idea of it ────────────────────────────
+
+    def balances(self) -> dict[str, dict[str, float]]:
+        """Free/used/total per asset, straight from the exchange."""
+        if not self.markets_loaded:
+            self.exchange.load_markets()
+            self.markets_loaded = True
+        raw = self.exchange.fetch_balance() or {}
+        out: dict[str, dict[str, float]] = {}
+        for asset, amount in (raw.get("total") or {}).items():
+            if not amount:
+                continue
+            out[asset] = {
+                "free": float((raw.get("free") or {}).get(asset) or 0.0),
+                "used": float((raw.get("used") or {}).get(asset) or 0.0),
+                "total": float(amount),
+            }
+        return out
+
+    def equity(self, quote: str = "USDT") -> tuple[float, dict[str, float]]:
+        """Account value in the quote asset: quote free + the rest marked to cash.
+
+        Only the quote balance is counted as cash. Anything held in another
+        asset is reported in the second value for the operator to look at — this
+        deliberately does not fetch prices to mark it, because a broker that
+        quotes its own book from a separate price call is a broker whose numbers
+        disagree with the dashboard's.
+        """
+        balances = self.balances()
+        cash = float(balances.get(quote, {}).get("total", 0.0))
+        return cash, {k: v["total"] for k, v in balances.items() if k != quote}
 
     def info(self) -> dict[str, Any]:
         return {

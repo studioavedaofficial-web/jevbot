@@ -210,11 +210,70 @@ before an order is sized off it. Any of `JEVBOT_BROKER_TESTNET`,
 read at startup (see `.env.example`); a real environment variable wins over the
 file.
 
-The testnet keys are sandbox credentials: they can move fake balances, not real
-ones. Because the broker stays `paper`, they are not needed for fills at all —
-prices are fetched from the public endpoints and orders are filled locally at
-those prices minus slippage. Switch `[broker] kind = "ccxt"` to route the same
-orders to the testnet matching engine instead.
+### Orders on the testnet matching engine
+
+The profile ships with `[broker] kind = "ccxt"`, so orders are **placed on the
+sandbox venue and filled by Binance**, not by the local simulator. Same fake
+money, real order flow: real signing, real rejections, real lot sizes, real
+fees, and a real order history you can open on
+[testnet.binance.vision](https://testnet.binance.vision).
+
+Before letting the loop trade, place one order by hand:
+
+```bash
+jevbot testnet-order --config config/binance_testnet.toml --notional 12 --yes
+```
+
+It prints the endpoint, the quantity it will send, the venue's order id and the
+fill, then tells you where to look for it. It refuses to run against anything
+that is not a sandbox endpoint, and it clamps the ticket to
+`risk.max_order_notional`. Nothing else in the project places an order on
+demand like this.
+
+Going back to local fills is one line — `[broker] kind = "paper"` — or one flag:
+`jevbot run --mode paper`, which keeps the testnet prices and routes nothing.
+
+### Safety rails
+
+The bot sizes positions as a fraction of equity, so a wrong price or a wrong
+weight becomes a wrong ticket. These are the limits that stand between that and
+the venue (`[risk]` in `config/binance_testnet.toml`):
+
+| limit | default | what it does |
+|---|---|---|
+| `max_order_notional` | 50 | no single order may *add* more exposure than this. Exits are exempt — clipping a close leaves dust, and dust re-arms a close every cycle forever |
+| `max_consecutive_rejections` | 5 | stop sending orders entirely after this many refusals in a row. A venue that says no five times is not unlucky; the account, symbol or key is wrong, and the next order will not be the one that works |
+| `daily_loss_limit_pct` | 3% | flatten and stand down for the rest of the UTC day |
+| `max_drawdown_pct` | 10% | latching kill switch; only an operator clears it (`Reset kill` on the dashboard) |
+| `min_order_notional` | 25 | the smallest ticket worth paying a round trip for |
+
+Two behaviours worth knowing before you trust any of it:
+
+* **The breaker is a choke point.** Once tripped, `submit()` refuses orders no
+  matter who calls it, the cycle stops planning them, and the dashboard shows
+  *venue breaker* with a `Reset breaker` button. It does **not** try to flatten:
+  a venue refusing orders would refuse the exit too, and the bot would report a
+  flat account it does not have.
+* **Sizing follows the account, not the config.** On startup a venue broker
+  reads the sandbox balance and re-bases the portfolio and the risk anchor on
+  it — otherwise a $100,000 config against a $1,500 sandbox reads as a 98.5%
+  drawdown on cycle one and trips the kill switch.
+
+### Real money is a separate, deliberate step
+
+Testnet is a sandbox that says yes. Real money is the venue saying no for
+reasons nobody documented. When you get there:
+
+1. Create the keys **with withdrawals disabled** (Binance asks for a separate
+   permission for that — leave it off; a bot only ever needs spot trade).
+2. Restrict the key to your IP if the exchange allows it.
+3. Fund it with an amount you would shrug at losing, and set
+   `testnet = false` for **both** `[feeds]` and `[broker]`.
+4. Tighten the rails first: `max_order_notional`, `daily_loss_limit_pct`,
+   `max_drawdown_pct`. Then run with `[broker] kind = "paper"` against live
+   prices for a day and watch what it *would* have done.
+5. Live orders additionally need `JEVBOT_I_UNDERSTAND_LIVE_RISK=yes`. The
+   dashboard then shows `LIVE ORDERS — REAL MONEY` and `broker.live` is true.
 
 Two caveats that matter more than the setup:
 
@@ -270,7 +329,7 @@ jevbot/
   server.py       the dashboard's JSON API and static files
   web/            the dashboard (no framework, no build step)
 scripts/          gen_data.py, backtest.py, eval_engine.py
-tests/            182 tests: the book, the planner, the governor, the metrics, the API
+tests/            203 tests: the book, the planner, the governor, the metrics, the API
 ```
 
 ## Testing
@@ -279,10 +338,13 @@ tests/            182 tests: the book, the planner, the governor, the metrics, t
 pip install -e ".[dev]" && pytest -q
 ```
 
-The suite runs entirely offline: no network, no GPU, no API keys — the events
-handlers in `tests/test_live_venue_integration.py` are the one exception, and
-they talk to a local HTTP server instead of a venue, through a real `ccxt`
-client so the request paths and response parsing are the production ones. It is
+The suite runs entirely offline: no network, no GPU, no API keys — the handlers
+in `tests/test_live_venue_integration.py` and `tests/test_venue_orders.py` are
+the one exception, and they talk to a local HTTP server instead of a venue,
+through a real `ccxt` client so the request paths, the HMAC signing and the
+response parsing are the production ones. That server **verifies the signature
+on the way in**, so a passing order test means the client really signed with the
+key it was given. It is
 written around the failures that actually cost time here — a quantity passed where a
 notional was expected (a fill that is small, wrong, and perfectly plausible), a
 fill that debits cash without writing a position, dust that re-arms a close
@@ -291,7 +353,22 @@ history producing a full report of zeros, a broker bound to a different
 portfolio than the bot, and a side passed as a plain string (equal to `Side.BUY`
 but not identical to it, so a buy filled below the mid).
 
-Two of those were found by the venue test above rather than by reading the code:
+Order routing is verified the same way, and it is worth being precise about
+what that does and does not prove. `tests/test_venue_orders.py` covers the POST
+to `/order`, the signature, the venue's own fill price and commission, a
+rejected order, the rejection breaker, and the startup balance adoption — all
+over a real socket, through ccxt's real signing and parsing. It cannot tell you
+that Binance testnet accepts these keys: that check requires egress, and is what
+`jevbot doctor --config config/binance_testnet.toml` and
+`jevbot testnet-order` are for.
+
+Bugs this caught before any of them reached a venue: `create_order(...,
+params=None)` — ccxt mutates the params dict it is handed and `None` is not a
+dict, so the very first real order died inside ccxt's own plumbing; and the
+breaker's first implementation only blocked the cycle path, so a direct
+`submit()` still put orders on the wire after it tripped.
+
+Two more were found by the venue test above rather than by reading the code:
 the live candle feed re-fed its whole window on every poll — which the feature
 engine correctly rejects as out-of-order, so the second cycle of any real run
 failed — and the spot exchange client was loading futures markets too, so an

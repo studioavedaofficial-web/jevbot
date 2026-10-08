@@ -1,9 +1,10 @@
-"""End-to-end test of the live path, against a local Binance-shaped venue.
+"""End-to-end test of the live price path, against a local Binance-shaped venue.
 
-This sandbox cannot reach ``testnet.binance.vision``, so the venue is replaced
+The sandbox cannot reach ``testnet.binance.vision``, so the venue is replaced
 rather than the client: a real ``ccxt.binance`` instance is constructed, put
-into sandbox mode exactly as production does, and only then pointed at a local
-HTTP server that answers the same endpoints with the same JSON shape.
+into sandbox mode exactly as production does, and only then pointed at the local
+server in :mod:`tests.local_venue`, which answers the same endpoints with the
+same JSON shape.
 
 That distinction is the whole point. Mocking ccxt at the Python level (as
 ``tests/fake_ccxt.py`` does) proves the bot calls the right methods; it cannot
@@ -18,9 +19,7 @@ returns these numbers. Nothing run in this sandbox can.
 from __future__ import annotations
 
 import json
-import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
@@ -28,118 +27,18 @@ from jevbot.config import load_config
 from jevbot.feeds import build_price_feed
 from jevbot.portfolio import Portfolio
 from jevbot.types import Instrument
+from tests.local_venue import LocalVenue, closes
 
-# Deterministic tape: a gentle up-trend so the trend features are non-zero.
-START_MS = 1_700_000_000_000  # 2023-11-14, arbitrary but fixed
 BAR_MS = 60_000
-N_BARS = 600
-
-_PRICES = {
-    "BTCUSDT": 30_000.0,
-    "ETHUSDT": 1_800.0,
-}
-_DRIFT = {"BTCUSDT": 1.5, "ETHUSDT": 0.08}  # per-bar close increase
-
-
-def _closes(symbol: str) -> list[float]:
-    base, drift = _PRICES[symbol], _DRIFT[symbol]
-    return [base + drift * i for i in range(N_BARS)]
-
-
-def _klines(symbol: str, limit: int) -> list[list]:
-    out = []
-    for i, close in enumerate(_closes(symbol)[-limit:]):
-        idx = N_BARS - min(limit, N_BARS) + i
-        ts = START_MS + idx * BAR_MS
-        out.append([ts, close - 0.4, close + 0.6, close - 0.9, close, 7.5 + (idx % 3),
-                    ts + BAR_MS - 1, 100.0, 12, 4.0, 40.0, "0"])
-    return out
-
-
-class _Venue(BaseHTTPRequestHandler):
-    """The subset of the Binance spot REST API that jevbot touches."""
-
-    def log_message(self, *args):  # keep pytest output clean
-        pass
-
-    def _send(self, payload: dict | list, status: int = 200) -> None:
-        body = json.dumps(payload).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def do_GET(self):  # noqa: N802 - http.server's naming
-        path, _, query = self.path.partition("?")
-        params = dict(p.split("=", 1) for p in query.split("&") if "=" in p)
-        self.server.seen.append((path, params))
-
-        if path.endswith("/exchangeInfo"):
-            return self._send({"timezone": "UTC", "serverTime": START_MS + N_BARS * BAR_MS,
-                               "rateLimits": [], "exchangeFilters": [],
-                               "symbols": [self._symbol(s) for s in _PRICES]})
-        if path.endswith("/klines"):
-            symbol = params.get("symbol", "")
-            if symbol not in _PRICES:
-                return self._send({"code": -1121, "msg": "Invalid symbol."}, 400)
-            return self._send(_klines(symbol, int(params.get("limit", 500))))
-        if path.endswith("/ticker/24hr") or path.endswith("/ticker/price"):
-            symbol = params.get("symbol", "")
-            price = _closes(symbol)[-1]
-            if path.endswith("/ticker/price"):
-                return self._send({"symbol": symbol, "price": f"{price:.2f}"})
-            return self._send({"symbol": symbol, "lastPrice": f"{price:.2f}",
-                               "bidPrice": f"{price - 0.5:.2f}", "askPrice": f"{price + 0.5:.2f}",
-                               "closeTime": START_MS + N_BARS * BAR_MS})
-        return self._send({"code": -1121, "msg": f"unhandled {path}"}, 404)
-
-    @staticmethod
-    def _symbol(symbol: str) -> dict:
-        base = symbol[:-4]
-        return {
-            "symbol": symbol, "status": "TRADING", "baseAsset": base, "quoteAsset": "USDT",
-            "baseAssetPrecision": 8, "quoteAssetPrecision": 8, "quotePrecision": 8,
-            "baseCommissionPrecision": 8, "quoteCommissionPrecision": 8,
-            "orderTypes": ["LIMIT", "MARKET"], "icebergAllowed": True, "ocoAllowed": True,
-            "quoteOrderQtyMarketAllowed": True, "isSpotTradingAllowed": True,
-            "isMarginTradingAllowed": False, "permissions": ["SPOT"],
-            "filters": [
-                {"filterType": "PRICE_FILTER", "minPrice": "0.01", "maxPrice": "1000000",
-                 "tickSize": "0.01"},
-                {"filterType": "LOT_SIZE", "minQty": "0.00001", "maxQty": "9000",
-                 "stepSize": "0.00001"},
-                {"filterType": "NOTIONAL", "minNotional": "5", "applyMinToMarket": True},
-            ],
-        }
+START_MS = 1_700_000_000_000
 
 
 @pytest.fixture
 def venue(monkeypatch):
-    """A local venue plus a real ccxt client aimed at it."""
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _Venue)
-    server.seen = []
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    base = f"http://127.0.0.1:{server.server_address[1]}/api/v3"
-
-    from jevbot import venues
-
-    real_build = venues.build_ccxt_exchange
-
-    def build(exchange_id, **kwargs):
-        exchange = real_build(exchange_id, **kwargs)
-        # Everything above this line is production: sandbox mode applied by the
-        # shared builder, real headers, real parsing. Only the host is swapped.
-        exchange.urls["api"]["public"] = base
-        exchange.urls["api"]["private"] = base
-        return exchange
-
-    monkeypatch.setattr("jevbot.feeds.live.build_ccxt_exchange", build)
-    monkeypatch.setattr(venues, "build_ccxt_exchange", build)
-    yield server
-    server.shutdown()
-    server.server_close()
+    """A local venue with a real ccxt client aimed at it."""
+    with LocalVenue() as v:
+        v.attach(monkeypatch)
+        yield v
 
 
 def _feed(*, history_bars: int = 300, testnet: bool = True):
@@ -182,7 +81,7 @@ def test_real_ccxt_reads_the_venue_through_a_socket(venue):
     assert any(p.endswith("/klines") for p in paths), "candles were never fetched"
 
     snap = feed.snapshot("BTC/USDT")
-    expected = _closes("BTCUSDT")[-1]
+    expected = closes("BTCUSDT")[-1]
     assert snap is not None
     assert snap.last == pytest.approx(expected, rel=1e-6), (
         f"feed says {snap.last}, venue says {expected} — the candle was misparsed"
@@ -201,7 +100,7 @@ def test_the_venues_ticker_is_reachable_independently_of_the_candles(venue):
     """`ticker()` is the cross-check `doctor` relies on; it must be a real fetch."""
     feed = _feed(history_bars=120)
     price = feed.ticker("ETH/USDT")
-    assert price == pytest.approx(_closes("ETHUSDT")[-1], rel=1e-9)
+    assert price == pytest.approx(closes("ETHUSDT")[-1], rel=1e-9)
     assert any("/ticker" in p for p, _ in venue.seen), venue.seen
 
 

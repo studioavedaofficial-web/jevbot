@@ -201,3 +201,21 @@ def test_head_is_not_a_backdoor_to_mutate_state(served):
     except urllib.error.HTTPError as exc:
         assert exc.code in (404, 405)
     assert bot.status()["paused"] is before, "HEAD must never change the bot's state"
+
+
+def test_the_breaker_can_be_reset_from_the_dashboard(served):
+    """The operator's way out of a tripped venue breaker."""
+    base, bot = served
+    import json as _json
+    import urllib.request as _url
+
+    bot.venue_stopped = True
+    bot.venue_stop_reason = "3 consecutive venue rejections"
+    assert bot.status()["venue_stopped"] is True
+
+    req = _url.Request(base + "/api/control/reset_breaker", data=b"", method="POST")
+    with _url.urlopen(req, timeout=10) as resp:
+        body = _json.loads(resp.read().decode())
+    assert body["ok"] is True
+    assert bot.status()["venue_stopped"] is False
+    assert bot.status()["venue_stop_reason"] == ""

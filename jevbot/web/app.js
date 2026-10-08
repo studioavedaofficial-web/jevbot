@@ -91,9 +91,17 @@ function renderHeader() {
   const risk = bot.risk || {};
 
   const badges = [];
-  badges.push(broker.live
-    ? `<span class="badge live">LIVE ORDERS</span>`
-    : `<span class="badge paper">paper</span>`);
+  // The single most important thing for an operator to see: where orders go.
+  if (broker.live) {
+    badges.push(`<span class="badge live">LIVE ORDERS — REAL MONEY</span>`);
+  } else if (broker.testnet) {
+    badges.push(`<span class="badge testnet">TESTNET ORDERS</span>`);
+  } else {
+    badges.push(`<span class="badge paper">paper — fills simulated locally</span>`);
+  }
+  if (broker.testnet && broker.endpoint) {
+    badges.push(`<span class="badge venue">${fmt.esc(broker.endpoint.replace(/^https?:\/\//, '').split('/')[0])}</span>`);
+  }
   badges.push(engine.is_laya
     ? `<span class="badge laya">laya</span>`
     : `<span class="badge fallback">offline fallback engine</span>`);
@@ -101,6 +109,7 @@ function renderHeader() {
   if (risk.killed) badges.push(`<span class="badge killed">kill switch</span>`);
   if (risk.halted_today) badges.push(`<span class="badge killed">halted today</span>`);
   if (bot.paused) badges.push(`<span class="badge fallback">paused</span>`);
+  if (bot.venue_stopped) badges.push(`<span class="badge killed">venue breaker</span>`);
   if (bot.stop_requested) badges.push(`<span class="badge killed">stopping</span>`);
   el('badges').innerHTML = badges.join('');
 
@@ -113,10 +122,26 @@ function renderHeader() {
   const simClock = feed.sim_now_utc ? `sim ${fmt.time(feed.sim_now)}` : fmt.time(bot.now);
   el('clock').innerHTML = `${fmt.esc(simClock)} UTC<br/>cycle ${fmt.int(bot.cycle)} · up ${fmt.int(a.server?.uptime_seconds)}s`;
 
+  const banner = [];
+  if (broker.live) {
+    banner.push(`<b>LIVE ORDERS.</b> Every order below leaves for ${fmt.esc(broker.endpoint || 'the venue')} ` +
+      `and spends real money.`);
+  } else if (broker.testnet) {
+    banner.push(`<b>Testnet orders.</b> Orders are placed on ${fmt.esc(broker.endpoint || 'the sandbox venue')} ` +
+      `and filled by the venue's matching engine — fake money, real order flow. ` +
+      `Sent ${fmt.int(broker.orders_sent || 0)} · rejected ${fmt.int(broker.orders_rejected || 0)}.`);
+  }
   if (feed.synthetic) {
+    banner.push(`<b>Synthetic market.</b> ${fmt.esc(feed.warning || '')} ` +
+      `Numbers here validate the pipeline end to end; they are not a claim about live edge.`);
+  }
+  if (bot.venue_stopped) {
+    banner.push(`<b>Venue breaker tripped.</b> ${fmt.esc(bot.venue_stop_reason || '')} — ` +
+      `no orders are being sent. Fix the cause, then press Reset breaker.`);
+  }
+  if (banner.length) {
     el('warnbar').classList.remove('hidden');
-    el('warnbar').innerHTML = `<b>Synthetic market.</b> ${fmt.esc(feed.warning || '')} ` +
-      `Numbers here validate the pipeline end to end; they are not a claim about live edge.`;
+    el('warnbar').innerHTML = banner.join('<br/>');
   } else {
     el('warnbar').classList.add('hidden');
   }
@@ -235,6 +260,9 @@ function renderRisk() {
     ['max positions', fmt.int(L.max_positions)],
     ['signal floor', `${fmt.num(L.min_signal, 3)} (hold ${fmt.num((L.min_signal || 0) * (L.hold_signal_ratio ?? 0.5), 3)})`],
     ['round trip cost', `${fmt.num((broker.fee_bps || 0) + (broker.slippage_bps || 0) + (broker.half_spread_bps || 0), 1)} bps/side`],
+    ['max order', L.max_order_notional ? fmt.money(L.max_order_notional, 0) : 'uncapped'],
+    ['venue breaker', `${fmt.int(L.max_consecutive_rejections)} rejections in a row`
+      + (broker.orders_rejected ? ` (${fmt.int(broker.orders_rejected)} so far)` : '')],
     ['stale data', `${fmt.int(L.stale_data_seconds)}s`],
   ];
   const cool = Object.entries(risk.cooldowns || {});
@@ -392,6 +420,7 @@ document.querySelectorAll('[data-action]').forEach(b => {
     const action = b.dataset.action;
     if (action === 'stop' && !confirm('Stop the trading loop after the current cycle?')) return;
     if (action === 'flatten' && !confirm('Close every position at the next cycle and stop trading?')) return;
+    if (action === 'reset_breaker' && !confirm('Allow the bot to send orders to the venue again?')) return;
     const res = await post(`/api/control/${action}`);
     if (!res.ok) alert(res.error || 'action failed');
     poll();

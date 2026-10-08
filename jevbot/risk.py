@@ -46,6 +46,15 @@ class RiskLimits:
     min_cash_buffer: float = 0.02
     stale_data_seconds: float = 900.0
     min_order_notional: float = 25.0
+    # 0 disables the cap. It applies to orders that *add* exposure: an exit
+    # must never be clipped, or a position that cannot be closed in one ticket
+    # can never be closed at all.
+    max_order_notional: float = 0.0
+    # How many orders in a row the venue may reject before the bot stops
+    # sending any. A venue that says no five times is not unlucky; it is
+    # telling you the account, the symbol or the key is wrong, and the next
+    # order will not be the one that works.
+    max_consecutive_rejections: int = 5
     cooldown_seconds_after_stop: float = 1800.0
     max_turnover_per_cycle: float = 0.5
     min_signal: float = 0.05
@@ -128,6 +137,21 @@ class RiskGovernor:
         self.killed = False
         self.kill_reason = ""
         self.events.append({"ts": time.time(), "event": "kill_reset"})
+
+    def anchor_equity(self, equity: float, reason: str = "") -> None:
+        """Re-base the daily and high-water marks on an externally known equity.
+
+        Needed when the account's real size is discovered mid-flight — a venue
+        broker reads the sandbox balance on startup. Without this the governor
+        compares a $1,000 testnet account against the $100,000 the config
+        assumed and kills the run on its first cycle for a 99% drawdown that
+        never happened.
+        """
+        self.day_start_equity = float(equity)
+        self._peak = float(equity)
+        self.halted_today = False
+        self.events.append({"ts": time.time(), "event": "equity_anchor",
+                            "equity": float(equity), "reason": reason})
 
     # ── the gate ───────────────────────────────────────────────────────────
 

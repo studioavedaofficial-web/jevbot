@@ -26,12 +26,14 @@ from pathlib import Path
 from . import __version__
 from .backtest import compare_engines, compare_markdown, run_backtest, write_result
 from .bot import TradingBot
+from .brokers.base import LiveTradingRefused
 from .config import ROOT, ConfigError, load_config
 from .engine import build_engine
 from .engine.base import EngineUnavailable
 from .feeds import build_news_feed, build_price_feed
 from .feeds.base import FeedError
 from .metrics import score_decisions
+from .risk import RiskLimits
 from .store import Store
 
 LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
@@ -133,6 +135,7 @@ def cmd_doctor(args) -> int:
         if engine is not None:
             engine.close()
 
+    feed_failed = False
     try:
         price = build_price_feed(cfg, speed=1.0)
         news = build_news_feed(cfg, price_feed=price)
@@ -170,8 +173,10 @@ def cmd_doctor(args) -> int:
                 print(f"            {symbol:10s} feed {snap.last:>12,.2f} vs ticker {tick:>12,.2f}"
                       f"  ({delta * 100:+6.2f}% {flag})")
     except Exception as exc:
+        # Report and keep going: the broker block below is exactly what an
+        # operator needs next, and it does not depend on the feed being up.
         print(f"feeds:    FAILED — {exc}")
-        return 3
+        feed_failed = True
 
     from .routing import NewsRouter
 
@@ -182,12 +187,16 @@ def cmd_doctor(args) -> int:
         syms, why = r.route(type("N", (), {"text": text, "symbols": (), "url": ""})())
         print(f"  route: {text[:48]:<50s} -> {syms or '—'}  ({why})")
 
-    if cfg.broker_kind == "ccxt":
+    if cfg.broker_kind != "paper" or cfg.testnet:
         from .brokers import build_broker
+        from .portfolio import Portfolio
 
         try:
-            broker = build_broker(cfg, __import__("jevbot.portfolio", fromlist=["Portfolio"]).Portfolio.fresh(1.0),
-                                  force_paper=True)
+            # Built for real, not forced to paper: the question this block
+            # answers is "where would an order actually go", and a paper broker
+            # cannot answer it. Constructing one places nothing.
+            broker = build_broker(cfg, Portfolio.fresh(
+                float(cfg.get("risk", "starting_equity", default=1000.0))))
             binfo = broker.info()
             print(f"\nbroker:   {binfo.get('broker')} ({binfo.get('exchange', '—')})")
             print(f"          endpoint: {binfo.get('endpoint') or 'unknown'}")
@@ -195,6 +204,25 @@ def cmd_doctor(args) -> int:
             if not binfo.get("testnet"):
                 print("          WARNING: this endpoint can move real money; orders need")
                 print("                   JEVBOT_I_UNDERSTAND_LIVE_RISK=yes as well.")
+            else:
+                print("          orders would be placed on the sandbox matching engine")
+                equity_fn = getattr(broker, "equity", None)
+                if callable(equity_fn):
+                    try:
+                        cash, holdings = equity_fn()
+                        held = ", ".join(f"{v:g} {k}" for k, v in holdings.items() if v)
+                        print(f"          sandbox balance: {cash:,.2f} USDT"
+                              + (f" · holding {held}" if held else ""))
+                        if cash <= 0 and not held:
+                            print("                           (use the testnet faucet before trading)")
+                    except Exception as exc:
+                        print(f"          sandbox balance: unavailable — {str(exc)[:70]}")
+            limits = RiskLimits.from_config(cfg)
+            print("          safety:   max order "
+                  + (f"{limits.max_order_notional:,.0f}" if limits.max_order_notional else "uncapped")
+                  + f" · stop after {limits.max_consecutive_rejections} rejections"
+                  + f" · daily loss {limits.daily_loss_limit_pct:.0%}"
+                  + f" · kill at {limits.max_drawdown_pct:.0%} drawdown")
         except Exception as exc:
             print(f"\nbroker:   unavailable — {exc}")
 
@@ -204,7 +232,99 @@ def cmd_doctor(args) -> int:
     elif not cfg.live and cfg.broker_kind != "paper":
         print("\nnote: mode is paper, so live orders are impossible in this run.")
 
+    if feed_failed:
+        print("\nAt least one check failed — the notes above name what.")
+        return 3
     print("\nAll good. Next: `jevbot run --serve` or `jevbot backtest --days 30`.")
+    return 0
+
+
+def cmd_testnet_order(args) -> int:
+    """Place one small order on the sandbox venue and report what came back.
+
+    This is the answer to "did it really go to Binance?", and it is deliberately
+    a separate command from `run`: one order, on request, with the endpoint and
+    the order id printed. A bot loop is a slow and confusing way to find out that
+    a key is wrong.
+    """
+    cfg, _ = _load(args)
+    from .brokers import build_broker
+    from .portfolio import Portfolio
+    from .types import MarketSnapshot, Order, Side
+    from .venues import is_local_endpoint, is_testnet_endpoint
+
+    if cfg.broker_kind != "ccxt":
+        print(f"this command only places orders through the ccxt broker "
+              f"(broker.kind is {cfg.broker_kind!r})")
+        return 2
+    try:
+        broker = build_broker(cfg, Portfolio.fresh(
+            float(cfg.get("risk", "starting_equity", default=1000.0))))
+    except Exception as exc:
+        # Constructing a mainnet broker without the live acknowledgement raises
+        # here. That is the refusal working, not a crash: say so plainly.
+        print(f"refusing: {exc}")
+        return 2
+    endpoint = getattr(broker, "rest_endpoint", "")
+    # Two independent conditions, and the first is not a string match: the
+    # broker only reports testnet when set_sandbox_mode was actually applied.
+    # The endpoint check then catches a config that points a "sandbox" broker at
+    # a live host anyway (sandbox mode rewrites every family, so this is a
+    # belt-and-braces check against a future adapter change).
+    sandbox = is_testnet_endpoint(endpoint) or is_local_endpoint(endpoint)
+    if not getattr(broker, "testnet", False) or not sandbox:
+        print(f"refusing: {endpoint or 'the configured endpoint'} is not a sandbox.")
+        print("this command exists to smoke-test a testnet key; it will not place")
+        print("an order anywhere that can move real money.")
+        return 2
+
+    symbol = args.symbol or cfg.symbols[0]
+    side = Side.BUY if (args.side or "buy").lower() == "buy" else Side.SELL
+    limits = RiskLimits.from_config(cfg)
+    notional = float(args.notional)
+    if limits.max_order_notional and notional > limits.max_order_notional:
+        print(f"clamping the order to risk.max_order_notional = {limits.max_order_notional:,.2f}")
+        notional = limits.max_order_notional
+
+    try:
+        broker.exchange.load_markets()
+        ticker = broker.exchange.fetch_ticker(symbol)
+    except Exception as exc:
+        print(f"could not read a price for {symbol} from {endpoint}: {exc}")
+        return 3
+    price = float(ticker.get("last") or ticker.get("close") or 0.0)
+    if not price:
+        print(f"the venue returned no price for {symbol}")
+        return 3
+    qty = float(broker.exchange.amount_to_precision(symbol, notional / price))
+    if qty <= 0:
+        print(f"{notional:,.2f} is below one lot of {symbol} at {price:,.2f}")
+        return 3
+
+    print(f"venue:    {endpoint}  (testnet — fake money)")
+    print(f"order:    {side.value} {qty:g} {symbol} ≈ {qty * price:,.2f} USDT at {price:,.2f}")
+    if not args.yes:
+        print("\nrefusing to place it without --yes.")
+        return 2
+
+    snap = MarketSnapshot(symbol=symbol, ts=time.time(), last=price)
+    try:
+        fill = broker.submit(Order(symbol=symbol, side=side, qty=qty, reason="testnet smoke order"),
+                             snap, ts=time.time())
+    except Exception as exc:
+        print(f"\nREJECTED by the venue: {exc}")
+        print("nothing was filled. Check the key's permissions and the account balance:")
+        print(f"  {endpoint}/account")
+        return 3
+    if fill is None:
+        print("\nthe venue accepted the order but has not printed a fill yet;"
+              " check open orders on the dashboard")
+        return 0
+    print(f"\nFILLED by the venue: {fill.qty:g} {symbol} at {fill.price:,.2f} · "
+          f"fee {fill.fee:,.4f} · order id {fill.order_id}")
+    print("\nConfirm it on Binance testnet → Wallet → Order history")
+    print("  https://testnet.binance.vision/")
+    print("If it is not there, the order did not reach the venue.")
     return 0
 
 
@@ -601,6 +721,15 @@ def build_parser() -> argparse.ArgumentParser:
     route.add_argument("--symbol", default=None)
     route.set_defaults(func=cmd_route)
 
+    smoke = sub.add_parser("testnet-order",
+                           help="place one small order on the sandbox venue and report the result")
+    common(smoke)
+    smoke.add_argument("--symbol", default=None, help="defaults to the first symbol in the universe")
+    smoke.add_argument("--notional", type=float, default=12.0, help="order size in quote currency")
+    smoke.add_argument("--side", default="buy", choices=["buy", "sell"])
+    smoke.add_argument("--yes", action="store_true", help="actually place it")
+    smoke.set_defaults(func=cmd_testnet_order)
+
     doc = sub.add_parser("doctor", help="check the environment")
     common(doc)
     doc.set_defaults(func=cmd_doctor)
@@ -615,6 +744,9 @@ def main(argv: list[str] | None = None) -> int:
         return int(args.func(args) or 0)
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
+        return 2
+    except LiveTradingRefused as exc:
+        print(f"refused: {exc}", file=sys.stderr)
         return 2
     except EngineUnavailable as exc:
         print(f"engine unavailable: {exc}", file=sys.stderr)

@@ -7,10 +7,13 @@
 #   price feed  → Binance testnet candles (testnet.binance.vision), so prices
 #                 are the venue's own rather than a generator's
 #   news feed   → live RSS headlines, routed by keyword against the universe
-#   broker      → paper. Fills are simulated locally; nothing reaches a venue,
-#                 testnet included. Set `[broker] kind = "ccxt"` to send orders
-#                 to the testnet matching engine instead (still fake money).
-#   risk        → unchanged. Same limits, same stops, same turnover cap.
+#   broker      → ccxt. Orders are placed on the testnet matching engine and
+#                 filled by Binance, not by a local simulator. Still fake money:
+#                 the keys are sandbox keys and the endpoint is the sandbox, so
+#                 nothing here can reach a real account.
+#   risk        → unchanged shape, plus explicit venue safety: a per-order
+#                 notional cap, a daily loss limit and a kill switch (see
+#                 `starting_equity` below — sizing follows the venue balance).
 #
 # The universe is crypto-only because that is what the venue lists. Equities
 # (AAPL/NVDA/SPY) stay in the default config's universe and would only ever
@@ -23,12 +26,34 @@ ccxt_exchange = "binance"
 testnet = true
 
 [broker]
-kind = "paper"
+kind = "ccxt"
 testnet = true
-# A touch more slippage than the default: the testnet order book is thin and
-# quoting it as if it were Binance mainnet would flatter every fill.
+# These two are paper-broker fill assumptions. They are kept here only because
+# the dashboard quotes a "round trip cost" — with kind = "ccxt" the venue sets
+# the real price and the real fee.
 slippage_bps = 5.0
 half_spread_bps = 3.0
+
+[risk]
+# Sizing is a fraction of equity, so equity has to resemble the account. A
+# testnet account usually holds a few thousand USDT; the bot reads the real
+# balance on startup and re-bases on it, and this value only covers the moment
+# before that happens. Do not set it to the default 100,000 unless you have
+# actually funded the sandbox with that much.
+starting_equity = 1000.0
+# Safety rails for real order flow:
+#   max_order_notional      — no single order may add more than this much
+#                             exposure (exits are exempt: a clipped close
+#                             leaves dust behind forever)
+#   max_consecutive_rejections — stop sending orders entirely after this many
+#                             refusals in a row, and wait for a human
+#   daily_loss_limit_pct    — flatten and stand down for the rest of the UTC day
+#   max_drawdown_pct        — latching kill switch
+max_order_notional = 50.0
+max_consecutive_rejections = 5
+daily_loss_limit_pct = 0.03
+max_drawdown_pct = 0.10
+min_order_notional = 25.0
 
 # Crypto only. `/USDT` pairs as Binance names them.
 [[universe.instruments]]

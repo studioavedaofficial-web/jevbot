@@ -133,3 +133,57 @@ def test_a_symbol_gets_one_order_per_cycle_and_the_stop_wins():
 
 def test_order_sign_follows_side():
     assert Order(symbol="X", side=Side.SELL, qty=2.0).side.sign == -1
+
+
+# ── the per-order size cap ──────────────────────────────────────────────────
+# A weight bug, a price feed that returns 1.0, a fat-fingered config: any of
+# them turns into one enormous ticket. The cap is the difference between a bad
+# cycle and a bad day — and it must never be able to block an exit.
+
+
+def test_the_order_cap_clips_a_large_buy():
+    p = Portfolio.fresh(1_000.0)
+    orders = plan_orders(p, {"X": 1.0}, {"X": snap("X", 100.0)},
+                         min_order_notional=10.0, max_order_notional=250.0, fee_bps=0.0)
+    assert len(orders) == 1
+    assert orders[0].qty == pytest.approx(2.5), f"bought {orders[0].qty}, cap allows 2.5"
+    assert orders[0].side is Side.BUY
+    assert "capped by" in orders[0].notes
+
+
+def test_the_order_cap_does_not_block_a_close():
+    """A close is exact, or dust re-arms it every cycle forever."""
+    p = Portfolio.fresh(1_000.0)
+    hold(p, "X", 10.0, 100.0)                       # $1,000 position
+    orders = plan_orders(p, {"X": 0.0}, {"X": snap("X", 100.0)},
+                         min_order_notional=10.0, max_order_notional=50.0, fee_bps=0.0)
+    assert len(orders) == 1
+    assert orders[0].side is Side.SELL
+    assert orders[0].qty == pytest.approx(10.0), "the exit must be the full position"
+    assert p.positions["X"].qty == pytest.approx(10.0), "nothing was touched"
+
+
+def test_the_order_cap_does_not_nibble_a_reduction_into_nothing():
+    """Trimming a position is a reduction; the cap is about adding exposure."""
+    p = Portfolio.fresh(1_000.0)
+    hold(p, "X", 10.0, 100.0)                       # $1,000 held
+    orders = plan_orders(p, {"X": 0.2}, {"X": snap("X", 100.0)},
+                         min_order_notional=10.0, max_order_notional=50.0, fee_bps=0.0)
+    assert len(orders) == 1
+    assert orders[0].side is Side.SELL
+    assert orders[0].qty == pytest.approx(8.0), "the reduction is not clipped by the entry cap"
+
+
+def test_a_capped_ticket_below_the_minimum_is_dropped_entirely():
+    """Clipping to $2 is worse than not trading: it pays a round trip to be dust."""
+    p = Portfolio.fresh(1_000.0)
+    orders = plan_orders(p, {"X": 1.0}, {"X": snap("X", 100.0)},
+                         min_order_notional=10.0, max_order_notional=5.0, fee_bps=0.0)
+    assert orders == []
+
+
+def test_zero_means_no_cap():
+    p = Portfolio.fresh(1_000.0)
+    orders = plan_orders(p, {"X": 1.0}, {"X": snap("X", 100.0)},
+                         min_order_notional=10.0, max_order_notional=0.0, fee_bps=0.0)
+    assert orders[0].qty == pytest.approx(10.0, rel=0.02)

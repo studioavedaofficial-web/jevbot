@@ -142,6 +142,39 @@ def test_health_is_cheap_and_always_answers(served):
     assert get(base + "/api/health")["ok"] is True
 
 
+def test_a_broken_payload_answers_500_instead_of_dropping_the_socket(served, monkeypatch):
+    """A dropped connection reads to a browser exactly like a dead server.
+
+    The dashboard polls every two seconds, so a transient failure while the bot
+    is mid-cycle has to come back as an answerable error, not as a hole.
+    """
+    base, bot = served
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(type(bot), "status", boom)
+    req = urllib.request.Request(base + "/api/state")
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req, timeout=10)
+    assert exc.value.code == 500
+    body = json.loads(exc.value.read().decode())
+    assert "database is locked" in body["error"]
+
+
+def test_health_survives_a_broken_bot(served, monkeypatch):
+    """Health is what a monitor watches; it must not depend on the bot's mood."""
+    base, bot = served
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("store unavailable")
+
+    monkeypatch.setattr(bot.store, "counts", boom)
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(base + "/api/health", timeout=10)
+    assert exc.value.code == 500
+
+
 def test_a_missing_route_is_a_404(served):
     base, _ = served
     with pytest.raises(urllib.error.HTTPError) as exc:

@@ -169,8 +169,40 @@ class DashboardServer:
                     return default
 
             # routes -------------------------------------------------------
+
+            def _dispatch(self, verb: str) -> None:
+                """Route one request; never let the socket die mid-response.
+
+                An exception inside a payload builder (SQLite busy while the bot
+                is mid-cycle, a half-written row) would otherwise drop the
+                connection with no reply at all — which a browser reports the
+                same way it reports a dead server. A 500 with the reason keeps
+                the page alive and puts the fault where it can be read.
+                """
+                try:
+                    return self._route(verb)
+                except (BrokenPipeError, ConnectionResetError):  # pragma: no cover
+                    raise
+                except Exception as exc:
+                    log.exception("dashboard %s %s failed", verb, self.path)
+                    try:
+                        self._send_json({"error": str(exc), "path": self.path}, 500)
+                    except Exception:  # pragma: no cover - headers already sent
+                        pass
+
             def do_GET(self) -> None:  # noqa: N802
+                self._dispatch("GET")
+
+            def do_POST(self) -> None:  # noqa: N802
+                self._dispatch("POST")
+
+            def _route(self, verb: str) -> None:
                 path, qs = self._query()
+                if verb == "POST":
+                    if path.startswith("/api/control/"):
+                        action = path.rsplit("/", 1)[-1]
+                        return self._send_json(server.control(action))
+                    return self._send_json({"error": "not found", "path": path}, 404)
                 if path in ("/", "/index.html"):
                     return self._send_file(WEB_DIR / "index.html")
                 if path.startswith("/static/"):
@@ -191,13 +223,6 @@ class DashboardServer:
                     return self._send_json(server.risk())
                 if path == "/api/health":
                     return self._send_json({"ok": True, **server.state()["store"]})
-                self._send_json({"error": "not found", "path": path}, 404)
-
-            def do_POST(self) -> None:  # noqa: N802
-                path, _ = self._query()
-                if path.startswith("/api/control/"):
-                    action = path.rsplit("/", 1)[-1]
-                    return self._send_json(server.control(action))
                 self._send_json({"error": "not found", "path": path}, 404)
 
         return Handler

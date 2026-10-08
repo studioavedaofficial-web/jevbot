@@ -77,18 +77,25 @@ def build_price_feed(cfg, *, speed: float = 1.0, clock: Any | None = None,
 
         feed = CCXTPriceFeed(
             instruments,
-            exchange_id=os.environ.get("JEVBOT_CCXT_EXCHANGE", "binance"),
+            exchange_id=(cfg.get("feeds", "ccxt_exchange", default=None)
+                         or os.environ.get("JEVBOT_CCXT_EXCHANGE", "binance")),
             bar_seconds=bar_seconds,
+            # Default to the broker's endpoint family so a testnet run cannot
+            # end up reading mainnet prices (or the reverse) by omission.
+            testnet=bool(cfg.get("feeds", "testnet", default=cfg.testnet)),
+            api_key=os.environ.get("BINANCE_API_KEY", ""),
+            api_secret=os.environ.get("BINANCE_API_SECRET", ""),
         )
-        feed.prime()
+        # Deliberately not primed here. Priming is a network call, and a builder
+        # that does I/O makes every caller fail at construction — including the
+        # dashboard process that exists to *report* the outage. TradingBot.warmup
+        # primes; snapshot() primes on first use for anything that skips warmup.
         return feed
 
     if kind == "alpaca":
         from .live import AlpacaPriceFeed
 
-        feed = AlpacaPriceFeed(instruments, bar_seconds=bar_seconds)
-        feed.prime()
-        return feed
+        return AlpacaPriceFeed(instruments, bar_seconds=bar_seconds)
 
     if kind in {"jsonl", "replay"}:
         from .jsonl import JsonlPriceFeed
@@ -130,8 +137,11 @@ def build_news_feed(cfg, *, price_feed: PriceFeed | None = None, market: Any | N
     if kind == "rss":
         from .live import RSSNewsFeed
 
-        urls = os.environ.get("JEVBOT_RSS_URLS", "")
-        return RSSNewsFeed([u.strip() for u in urls.split(",") if u.strip()],
+        # config first, then the environment: JEVBOT_RSS_URLS already lands in
+        # feeds.rss_urls via ENV_MAP, so one lookup covers both.
+        raw = cfg.get("feeds", "rss_urls", default=[]) or []
+        urls = [str(u).strip() for u in (raw if isinstance(raw, (list, tuple)) else str(raw).split(","))]
+        return RSSNewsFeed([u for u in urls if u],
                            symbol_map=symbol_map_from_instruments(instruments))
 
     if kind == "webhook":

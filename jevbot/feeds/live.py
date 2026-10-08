@@ -16,12 +16,20 @@ import urllib.request
 from typing import Any, Iterable
 
 from ..types import Instrument, MarketSnapshot, NewsItem
+from ..venues import CCXTUnavailable, build_ccxt_exchange, rest_endpoint
 from .base import FeedError, NewsFeed, PriceFeed
 from .features import RollingFeatures
 
 
 class CCXTPriceFeed(PriceFeed):
-    """Crypto candles via ccxt. Public endpoints by default (no keys needed)."""
+    """Crypto candles via ccxt, mainnet or testnet. Public data: no keys needed.
+
+    ``testnet=True`` calls ``set_sandbox_mode(True)``, which is the only correct
+    way to point ccxt at a sandbox — it rewrites the REST *and* WebSocket URLs
+    together. Overriding ``base_url`` by hand leaves the other half aimed at the
+    live venue, which is the kind of mistake that only shows up as a puzzling
+    404 at 3am.
+    """
 
     name = "ccxt"
 
@@ -33,15 +41,18 @@ class CCXTPriceFeed(PriceFeed):
         bar_seconds: int = 300,
         history_bars: int = 400,
         funding: bool = True,
+        testnet: bool = False,
+        api_key: str = "",
+        api_secret: str = "",
     ) -> None:
         try:
-            import ccxt
-        except ImportError as exc:  # pragma: no cover - optional dependency
-            raise FeedError("ccxt is not installed (pip install 'jevbot[crypto]')") from exc
-        if not hasattr(ccxt, exchange_id):
-            raise FeedError(f"unknown ccxt exchange id: {exchange_id!r}")
-        self.exchange = getattr(ccxt, exchange_id)({"enableRateLimit": True})
+            self.exchange = build_ccxt_exchange(
+                exchange_id, api_key=api_key, api_secret=api_secret, testnet=testnet
+            )
+        except CCXTUnavailable as exc:
+            raise FeedError(str(exc)) from exc
         self.exchange_id = exchange_id
+        self.testnet = bool(testnet)
         self.symbols = [i.symbol for i in instruments if i.market == "crypto"]
         self.bar_seconds = bar_seconds
         self.history_bars = history_bars
@@ -51,10 +62,38 @@ class CCXTPriceFeed(PriceFeed):
         self._markets_loaded = False
         self._funding_rate: dict[str, float] = {}
 
+    # ── provenance ─────────────────────────────────────────────────────────
+
+    @property
+    def endpoint(self) -> str:
+        return rest_endpoint(self.exchange)
+
+    def _network_error(self, exc: Exception, symbol: str, what: str) -> FeedError:
+        where = f"{self.exchange_id}{' testnet' if self.testnet else ''}"
+        subject = f"{what} for {symbol}" if symbol and symbol != "-" else what
+        return FeedError(
+            f"could not fetch {subject} from {where} "
+            f"({self.endpoint or 'endpoint unknown'}): {exc}"
+        )
+
     def _ensure_markets(self) -> None:
         if not self._markets_loaded:
-            self.exchange.load_markets()
+            try:
+                self.exchange.load_markets()
+            except Exception as exc:  # pragma: no cover - network
+                raise self._network_error(exc, "-", "markets") from exc
             self._markets_loaded = True
+        missing = [s for s in self.symbols if s not in (self.exchange.markets or {})]
+        if missing:
+            available = sorted(
+                s for s in (self.exchange.markets or {})
+                if s.endswith("/USDT") and ":" not in s
+            )[:12]
+            raise FeedError(
+                f"{self.exchange_id}{' testnet' if self.testnet else ''} does not list "
+                f"{', '.join(missing)}. Check universe.instruments against the venue; "
+                f"some USDT pairs it does list: {', '.join(available) or 'none'}"
+            )
 
     def _candle_limit(self) -> int:
         seconds = int(self.bar_seconds)
@@ -72,12 +111,29 @@ class CCXTPriceFeed(PriceFeed):
         try:
             ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe=self._timeframe(), limit=self.history_bars)
         except Exception as exc:  # pragma: no cover - network
-            raise FeedError(f"could not fetch candles for {symbol}: {exc}") from exc
+            raise self._network_error(exc, symbol, "candles") from exc
+        if not ohlcv:
+            raise FeedError(
+                f"{self.exchange_id}{' testnet' if self.testnet else ''} returned no candles "
+                f"for {symbol} at {self._timeframe()}"
+            )
+        # Each poll returns the whole window, so every poll but the first
+        # replays bars the feature engine has already ingested. Those must be
+        # skipped: re-feeding an older bar is what the engine rejects as
+        # out-of-order, and re-feeding it politely would be worse — the window
+        # would be counted several times and the volatility estimate would
+        # quietly collapse. The newest bar is deliberately *not* skipped: it is
+        # still forming, and the engine knows how to update a bar it has seen.
+        seen = self._last_bar.get(symbol)
+        newest = seen or 0.0
         for ts_ms, _o, _h, _l, close, volume in ohlcv:
             ts = ts_ms / 1000.0
+            if seen is not None and ts < seen:
+                continue
             self.features.update(symbol, ts, float(close), float(volume or 0.0))
+            newest = max(newest, ts)
         if ohlcv:
-            self._last_bar[symbol] = ohlcv[-1][0] / 1000.0
+            self._last_bar[symbol] = newest
 
     def _timeframe(self) -> str:
         minutes = max(1, self.bar_seconds // 60)
@@ -103,12 +159,33 @@ class CCXTPriceFeed(PriceFeed):
             self._poll_symbol(symbol)
         return self.features.snapshot(symbol, funding=self._funding_rate.get(symbol))
 
+    def ticker(self, symbol: str) -> float | None:
+        """The venue's latest traded price — used to verify the feed independently.
+
+        Candles answer "what happened", a ticker answers "what is it now", and
+        comparing the two catches the case this class cannot see on its own: a
+        feed pointed at the right venue but the wrong market.
+        """
+        self._ensure_markets()
+        try:
+            tick = self.exchange.fetch_ticker(symbol)
+        except Exception as exc:  # pragma: no cover - network
+            raise self._network_error(exc, symbol, "ticker") from exc
+        for key in ("last", "close", "bid", "ask"):
+            value = tick.get(key)
+            if value:
+                return float(value)
+        return None
+
     def info(self) -> dict[str, Any]:
         return {
             "feed": self.name,
             "exchange": self.exchange_id,
+            "testnet": self.testnet,
+            "endpoint": self.endpoint,
             "symbols": self.symbols,
             "bar_seconds": self.bar_seconds,
+            "synthetic": False,
         }
 
 

@@ -7,6 +7,7 @@ is also the environment a contributor is most likely to have.
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -16,17 +17,44 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from jevbot import config as jevbot_config  # noqa: E402
 from jevbot.config import load_config  # noqa: E402
 from jevbot.engine import HeuristicEngine  # noqa: E402
 from jevbot.feeds.demo import DemoMarket  # noqa: E402
 from jevbot.types import Instrument, MarketSnapshot  # noqa: E402
 
 
+_AMBIENT_PREFIXES = ("JEVBOT_", "BINANCE_", "ALPACA_", "CCXT_")
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _hermetic_environment(tmp_path_factory):
+    """No test may depend on the machine it runs on.
+
+    Clears the JEVBOT_*/BINANCE_*/ALPACA_* environment and points the ``.env``
+    lookup at a path that does not exist, so a developer running the suite with
+    real Binance keys in ``.env`` exercises exactly the same code as CI does.
+    Tests that *are* about environment handling pass explicit dicts or paths.
+    """
+    for key in list(os.environ):
+        if key.startswith(_AMBIENT_PREFIXES):
+            del os.environ[key]
+    jevbot_config.DEFAULT_ENV_FILE = tmp_path_factory.mktemp("env") / "absent.env"
+
+
 @pytest.fixture
 def cfg():
-    """A small, fast config: two symbols, a four-day market, no network."""
-    c = load_config()
+    """A small, fast config: two symbols, a four-day market, no network.
+
+    Hermetic on purpose: ``dotenv=False`` and explicit feed kinds, so a
+    developer's local ``.env`` (Binance testnet, live RSS) cannot change what
+    the suite exercises. Tests that depend on ambient machine state pass on one
+    laptop and fail on another, which is worse than not having them.
+    """
+    c = load_config(dotenv=False)
     c.raw["engine"]["name"] = "heuristic"
+    c.raw["feeds"] = {"price": "synthetic", "news": "demo", "testnet": False, "rss_urls": []}
+    c.raw["broker"] = {**c.raw.get("broker", {}), "kind": "paper", "testnet": False}
     c.raw["universe"]["instruments"] = [
         {"symbol": "BTC/USDT", "market": "crypto", "name": "Bitcoin"},
         {"symbol": "AAPL", "market": "equity", "name": "Apple"},

@@ -8,6 +8,10 @@ from __future__ import annotations
 
 import pytest
 
+from jevbot.feeds.base import FeedError, PriceFeed
+from jevbot.types import MarketSnapshot
+
+
 def test_the_bot_uses_the_clock_it_was_given(rig):
     bot, clock, market = rig
     assert bot.now() == pytest.approx(clock["now"])
@@ -110,3 +114,73 @@ def test_events_are_kept_for_the_operator(rig):
     kinds = {e["kind"] for e in bot.events}
     assert "boot" in kinds
     assert any(k in kinds for k in {"news", "decide", "risk", "order"})
+
+
+# ── a dead feed is reported once, not once per cycle ─────────────────────────
+# The dashboard's event list holds 400 entries. A feed that is down for an hour
+# would fill all of them with the same sentence and push out everything else.
+
+
+class _FlakyFeed(PriceFeed):
+    """Serves a snapshot until told to fail, then raises the same error."""
+
+    name = "flaky"
+
+    def __init__(self, price: float = 100.0):
+        self.price = price
+        self.fail = False
+        self.polls = 0
+
+    def info(self):
+        return {"feed": self.name, "synthetic": False}
+
+    def snapshot(self, symbol, now=None):
+        self.polls += 1
+        if self.fail:
+            raise FeedError("could not fetch markets from binance testnet (https://testnet.binance.vision/api/v3): refused")
+        return MarketSnapshot(symbol=symbol, ts=now or 1_700_000_000.0, last=self.price)
+
+
+def _flaky_bot(cfg, feed, market):
+    """A bot around a stand-in price feed, with the demo news feed it needs."""
+    from jevbot.bot import TradingBot
+    from jevbot.engine import HeuristicEngine
+    from jevbot.feeds.demo import DemoNewsFeed
+
+    return TradingBot(cfg, engine=HeuristicEngine(), price_feed=feed,
+                      news_feed=DemoNewsFeed(market, None))
+
+
+def test_a_repeated_feed_failure_is_logged_once_and_counted(cfg, market):
+    from jevbot.bot import TradingBot
+    from jevbot.engine import HeuristicEngine
+    from jevbot.feeds.base import FeedError
+
+    feed = _FlakyFeed()
+    bot = _flaky_bot(cfg, feed, market)
+    bot.cycle()
+    feed.fail = True
+    results = bot.run(cycles=5, interval=0)
+    errors = [e for e in bot.events if e["kind"] == "error"]
+    assert len(errors) == 1, f"expected one error row, got {len(errors)}: {errors}"
+    assert "testnet.binance.vision" in errors[0]["message"]
+    assert results == [], "a cycle that raised must not be reported as a cycle"
+    assert bot._cycles_since_error == 5  # noqa: SLF001 - the count is the point
+
+
+def test_a_recovered_feed_says_so(cfg, market):
+    from jevbot.bot import TradingBot
+    from jevbot.engine import HeuristicEngine
+
+    feed = _FlakyFeed()
+    bot = _flaky_bot(cfg, feed, market)
+    feed.fail = True
+    bot.run(cycles=2, interval=0)
+    feed.fail = False
+    bot.run(cycles=1, interval=0)
+    kinds = [e["kind"] for e in bot.events]
+    assert kinds.count("error") == 1, kinds
+    assert "ok" in kinds, kinds
+    recovered = [e for e in bot.events if e["kind"] == "ok"][0]
+    assert "recovered after" in recovered["message"]
+    assert bot._cycle_error == ""  # noqa: SLF001

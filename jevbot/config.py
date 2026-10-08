@@ -19,6 +19,7 @@ from .types import Instrument
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = ROOT / "config" / "default.toml"
+DEFAULT_ENV_FILE = ROOT / ".env"
 
 
 class ConfigError(RuntimeError):
@@ -52,12 +53,63 @@ ENV_MAP: dict[str, tuple[tuple[str, ...], str]] = {
     "JEVBOT_LAYA_PRELOAD": (("engine", "preload"), "bool"),
     "JEVBOT_LAYA_MIN_CONFIDENCE": (("engine", "min_confidence"), "float"),
     "JEVBOT_MODE": (("broker", "kind"), "mode"),           # paper|live -> broker kind stays paper unless live
+    "JEVBOT_BROKER_KIND": (("broker", "kind"), "str"),
+    "JEVBOT_BROKER_TESTNET": (("broker", "testnet"), "bool"),
     "JEVBOT_PRICE_FEED": (("feeds", "price"), "str"),
     "JEVBOT_NEWS_FEED": (("feeds", "news"), "str"),
+    "JEVBOT_FEED_TESTNET": (("feeds", "testnet"), "bool"),
+    "JEVBOT_CCXT_EXCHANGE": (("feeds", "ccxt_exchange"), "str"),
+    "JEVBOT_RSS_URLS": (("feeds", "rss_urls"), "list"),
     "JEVBOT_HOST": (("server", "host"), "str"),
     "JEVBOT_PORT": (("server", "port"), "int"),
     "JEVBOT_DB": (("server", "db"), "str"),
 }
+
+#: Keys that live in ``.env`` but are read straight from the environment by the
+#: broker adapters rather than mapped into the config tree.
+ENV_PASSTHROUGH_KEYS = (
+    "BINANCE_API_KEY",
+    "BINANCE_API_SECRET",
+    "BINANCE_TESTNET",
+    "JEVBOT_I_UNDERSTAND_LIVE_RISK",
+    "ALPACA_API_KEY_ID",
+    "ALPACA_API_SECRET_KEY",
+    "ALPACA_PAPER",
+    "JEVBOT_CSV_PATH",
+    "JEVBOT_CCXT_KEY",
+    "JEVBOT_CCXT_SECRET",
+)
+
+
+def load_env_file(path: str | Path | None = None) -> list[str]:
+    """Read ``.env`` into ``os.environ``; return the names that were applied.
+
+    Exists because a ``.env`` that nothing reads is worse than no ``.env`` at
+    all: the keys look configured, the process runs without them, and the bot
+    silently trades the wrong venue. Parsing is deliberately small (KEY=VALUE,
+    ``#`` comments, optional quotes) and real environment variables always win,
+    so an exported value can still override the file for a single run.
+    """
+    env_path = Path(path) if path is not None else DEFAULT_ENV_FILE
+    if not env_path.exists():
+        return []
+    applied: list[str] = []
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        if not key or key in os.environ:
+            continue                      # a real environment variable wins
+        os.environ[key] = value
+        applied.append(key)
+    return applied
 
 
 def _cast(raw: str, kind: str) -> Any:
@@ -67,6 +119,11 @@ def _cast(raw: str, kind: str) -> Any:
         return int(raw)
     if kind == "float":
         return float(raw)
+    if kind == "list":
+        # comma-separated in the environment, a real list in TOML
+        if isinstance(raw, (list, tuple)):
+            return [str(x) for x in raw]
+        return [part.strip() for part in str(raw).split(",") if part.strip()]
     return raw
 
 
@@ -141,7 +198,26 @@ class Config:
         return [i.symbol for i in self.instruments]
 
     @property
+    def testnet(self) -> bool:
+        """True when *any* part of this run talks to sandbox endpoints.
+
+        Either end being sandboxed is worth reporting as such: a mainnet price
+        feed next to a testnet broker is a legitimate configuration and a very
+        misleading one to describe as "live".
+        """
+        return bool(self.get("broker", "testnet", default=False)
+                    or self.get("feeds", "testnet", default=False))
+
+    @property
     def live(self) -> bool:
+        """True only for a real-money venue.
+
+        Testnet is excluded by construction rather than by remembering to set
+        ``mode.live = false``: a sandbox endpoint cannot move real money, so it
+        must never demand the live-trading acknowledgement or show a LIVE badge.
+        """
+        if self.get("broker", "testnet", default=False):
+            return False
         return bool(self.get("mode", "live", default=False)) and self.broker_kind != "paper"
 
     @property
@@ -163,8 +239,11 @@ class Config:
         return d
 
 
-def load_config(*paths: str | Path, env: dict[str, str] | None = None) -> Config:
+def load_config(*paths: str | Path, env: dict[str, str] | None = None,
+                dotenv: bool = True) -> Config:
     """Load, merge and validate a configuration."""
+    if env is None and dotenv:
+        load_env_file()
     env = dict(os.environ) if env is None else env
     raw: dict[str, Any] = {}
     if DEFAULT_CONFIG.exists():

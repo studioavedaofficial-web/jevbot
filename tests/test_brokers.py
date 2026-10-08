@@ -105,3 +105,43 @@ def test_rows_fill_round_trip_through_the_book():
     p.apply_fill(f)
     assert f.notional == pytest.approx(100.0)
     assert p.to_dict()["positions"][0]["symbol"] == "X"
+
+
+# ── a plain-string side must not invert an order ─────────────────────────────
+# `Side` is a str enum, so "buy" == Side.BUY is True while `"buy" is Side.BUY`
+# is False. Every broker picks direction with `is`. A side that arrives as a
+# string — from JSON, a script, or a test — used to pass every equality check
+# and then fill the wrong way round: a buy below the mid, a stop that adds to
+# the position it was meant to close. Found by the venue integration test.
+
+
+def test_order_normalises_a_string_side():
+    assert Order(symbol="BTC/USDT", side="buy", qty=1.0).side is Side.BUY
+    assert Order(symbol="BTC/USDT", side="sell", qty=1.0).side is Side.SELL
+
+
+def test_fill_normalises_a_string_side():
+    assert Fill(symbol="BTC/USDT", side="buy", qty=1.0, price=100.0, fee=0.0, ts=0.0).side is Side.BUY
+
+
+def test_a_buy_stated_as_a_string_still_fills_above_the_mid():
+    from jevbot.brokers import PaperBroker
+    from jevbot.types import MarketSnapshot, Side
+
+    broker = PaperBroker(Portfolio.fresh(100_000.0), fee_bps=0.0, slippage_bps=10.0)
+    snap = MarketSnapshot(symbol="BTC/USDT", ts=1.0, last=30_000.0, half_spread_bps=5.0)
+    fill = broker.submit(Order(symbol="BTC/USDT", side="buy", qty=0.1), snap, ts=1.0)
+    assert fill is not None
+    assert fill.price > snap.last, "a buy must cross the spread, not collect it"
+    assert fill.side is Side.BUY
+
+
+def test_a_sell_stated_as_a_string_still_fills_below_the_mid():
+    from jevbot.brokers import PaperBroker
+    from jevbot.types import MarketSnapshot
+
+    broker = PaperBroker(Portfolio.fresh(100_000.0), fee_bps=0.0, slippage_bps=10.0)
+    snap = MarketSnapshot(symbol="BTC/USDT", ts=1.0, last=30_000.0, half_spread_bps=5.0)
+    fill = broker.submit(Order(symbol="BTC/USDT", side="sell", qty=0.1), snap, ts=1.0)
+    assert fill is not None
+    assert fill.price < snap.last

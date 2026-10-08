@@ -63,8 +63,28 @@ refresh_seconds = 3600
 min_materiality = 0.30
 clip = 1.0
 
+[feeds]
+# Where the bot's eyes are. `synthetic` + `demo` is a fully offline testbed and
+# is the default so that a fresh clone runs with no keys and no network.
+#   price: synthetic | ccxt | alpaca | csv | jsonl
+#   news:  demo      | rss  | jsonl  | webhook
+price = "synthetic"
+news = "demo"
+ccxt_exchange = "binance"  # any ccxt id; binance pairs with testnet below
+# Sandbox endpoints for the price feed (testnet.binance.vision). The public
+# testnet endpoints need no API keys, so the feed works with testnet = true even
+# on a machine that has never seen a key. Set false to read mainnet public data.
+testnet = false
+# RSS/Atom sources for `news = "rss"`; JEVBOT_RSS_URLS overrides this.
+rss_urls = []
+
 [broker]
 kind = "paper"             # paper | ccxt | alpaca
+# Route the venue adapters at sandbox endpoints (Binance testnet, Alpaca paper).
+# A testnet run is *not* a live run: it needs no JEVBOT_I_UNDERSTAND_LIVE_RISK
+# acknowledgement, cannot move real money, and reports live: false to the
+# dashboard. See config/binance_testnet.toml for a ready-made profile.
+testnet = false
 # Smallest change of opinion worth paying for. Two bands, whichever is larger:
 # `rebalance_tolerance` as a fraction of equity, and
 # `rebalance_tolerance_relative` as a fraction of the position itself — so a

@@ -30,6 +30,7 @@ from .config import ROOT, ConfigError, load_config
 from .engine import build_engine
 from .engine.base import EngineUnavailable
 from .feeds import build_news_feed, build_price_feed
+from .feeds.base import FeedError
 from .metrics import score_decisions
 from .store import Store
 
@@ -135,11 +136,39 @@ def cmd_doctor(args) -> int:
     try:
         price = build_price_feed(cfg, speed=1.0)
         news = build_news_feed(cfg, price_feed=price)
+        info = price.info()
+        print(f"\nfeeds:    price={info.get('feed')} news={news.info().get('feed')}")
+        if info.get("exchange"):
+            where = "testnet" if info.get("testnet") else "mainnet"
+            print(f"          exchange: {info['exchange']} ({where})")
+            print(f"          endpoint: {info.get('endpoint') or 'unknown'}")
         snaps = price.snapshots(cfg.symbols)
-        print(f"\nfeeds:    price={price.info().get('feed')} news={news.info().get('feed')}")
         for symbol, snap in list(snaps.items())[:5]:
             print(f"          {symbol:10s} {snap.last:>12,.2f}  24h {snap.ret_24h * 100:+6.2f}%  "
                   f"vol {snap.vol_24h * 100:5.2f}%  trend {snap.trend}")
+
+        # The independent check: candles answer "what happened", a ticker
+        # answers "what is it now". If the two disagree, the feed is pointed at
+        # the wrong venue or market — and that is exactly the failure a
+        # reasonable-looking candle chart cannot show you.
+        if hasattr(price, "ticker"):
+            print("          cross-check against the venue's own ticker:")
+            for symbol in cfg.symbols:
+                snap = snaps.get(symbol)
+                if snap is None:
+                    continue
+                try:
+                    tick = price.ticker(symbol)
+                except Exception as exc:
+                    print(f"            {symbol:10s} ticker unavailable: {str(exc)[:70]}")
+                    continue
+                if not tick:
+                    print(f"            {symbol:10s} ticker returned nothing")
+                    continue
+                delta = (snap.last - tick) / tick if tick else 0.0
+                flag = "ok" if abs(delta) <= 0.005 else "MISMATCH"
+                print(f"            {symbol:10s} feed {snap.last:>12,.2f} vs ticker {tick:>12,.2f}"
+                      f"  ({delta * 100:+6.2f}% {flag})")
     except Exception as exc:
         print(f"feeds:    FAILED — {exc}")
         return 3
@@ -153,7 +182,26 @@ def cmd_doctor(args) -> int:
         syms, why = r.route(type("N", (), {"text": text, "symbols": (), "url": ""})())
         print(f"  route: {text[:48]:<50s} -> {syms or '—'}  ({why})")
 
-    if not cfg.live and cfg.broker_kind != "paper":
+    if cfg.broker_kind == "ccxt":
+        from .brokers import build_broker
+
+        try:
+            broker = build_broker(cfg, __import__("jevbot.portfolio", fromlist=["Portfolio"]).Portfolio.fresh(1.0),
+                                  force_paper=True)
+            binfo = broker.info()
+            print(f"\nbroker:   {binfo.get('broker')} ({binfo.get('exchange', '—')})")
+            print(f"          endpoint: {binfo.get('endpoint') or 'unknown'}")
+            print(f"          testnet:  {binfo.get('testnet')}   live: {binfo.get('live')}")
+            if not binfo.get("testnet"):
+                print("          WARNING: this endpoint can move real money; orders need")
+                print("                   JEVBOT_I_UNDERSTAND_LIVE_RISK=yes as well.")
+        except Exception as exc:
+            print(f"\nbroker:   unavailable — {exc}")
+
+    if cfg.testnet:
+        print("\nnote: testnet endpoints — real market data, fake money. Orders routed to")
+        print("      the venue cannot leave the sandbox.")
+    elif not cfg.live and cfg.broker_kind != "paper":
         print("\nnote: mode is paper, so live orders are impossible in this run.")
 
     print("\nAll good. Next: `jevbot run --serve` or `jevbot backtest --days 30`.")
@@ -169,7 +217,20 @@ def cmd_run(args) -> int:
                                 in {"synthetic", "demo", ""} else 1.0))
     store = Store(cfg.get("server", "db", default="data/store/jevbot.db"))
     bot = TradingBot(cfg, store=store, speed=speed)
-    bot.warmup()
+    try:
+        bot.warmup()
+    except FeedError as exc:
+        # A venue that is down, or a key that has been revoked, must not take
+        # the dashboard with it: the process that says *why* nothing is trading
+        # is the one worth keeping up, and the cycle loop is already written to
+        # retry every interval. Headless runs still fail fast — a script that
+        # asked for a live feed should not exit 0 having read nothing.
+        if args.no_serve:
+            print(f"could not start: {exc}")
+            return 3
+        print(f"warning: {exc}")
+        print("         the dashboard is up and each cycle will retry; the feed's")
+        print("         endpoint is named above, and the failure is logged in the UI.")
 
     if cfg.live and not os.environ.get("JEVBOT_I_UNDERSTAND_LIVE_RISK"):
         print("refusing to start: live mode needs JEVBOT_I_UNDERSTAND_LIVE_RISK=yes")
@@ -184,7 +245,15 @@ def cmd_run(args) -> int:
             host=str(args.host or cfg.get("server", "host", default="0.0.0.0")),
             port=int(args.port or cfg.get("server", "port", default=8000)),
         )
-        url = server.start(background=True)
+        try:
+            url = server.start(background=True)
+        except OSError as exc:
+            # Overwhelmingly this is "address already in use", and the port is
+            # almost always held by the dashboard the operator forgot about.
+            print(f"could not start the dashboard on {server.host}:{server.port}: {exc}")
+            print("pass --port to use another one, or stop the process holding it:")
+            print(f"  ss -ltnp | grep {server.port}")
+            return 4
         print(f"dashboard: {url}  (bind {server.host}:{server.port})")
     print(f"engine={bot.engine.name} broker={bot.broker.name} symbols={len(bot.symbols)} "
           f"speed={speed:g}x — Ctrl-C to stop")

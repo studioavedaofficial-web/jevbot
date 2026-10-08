@@ -149,6 +149,8 @@ class TradingBot:
         self.stop_requested = False
         self.flatten_requested = False
         self._risk_events_recorded = 0
+        self._cycle_error = ""
+        self._cycles_since_error = 0
         self.events: list[dict[str, Any]] = []
         self.latest_snapshots: dict[str, MarketSnapshot] = {}
         self.latest_signals: dict[str, Signal] = {}
@@ -494,15 +496,24 @@ class TradingBot:
                 continue
             try:
                 result = self.cycle()
-                out.append(result)
-                if on_cycle:
-                    on_cycle(result)
             except KeyboardInterrupt:  # pragma: no cover
                 break
             except Exception as exc:  # pragma: no cover - keep the loop alive
-                log.exception("cycle failed: %s", exc)
-                self._log("error", f"cycle failed: {exc}")
+                self._record_cycle_failure(exc)
                 time.sleep(min(5.0, interval))
+            else:
+                if self._cycle_error:
+                    self._log(
+                        "ok",
+                        f"recovered after {self._cycles_since_error} failed "
+                        f"cycle(s): {self._cycle_error}",
+                    )
+                    log.warning("cycle recovered after %d failure(s)", self._cycles_since_error)
+                    self._cycle_error = ""
+                self._cycles_since_error = 0
+                out.append(result)
+                if on_cycle:
+                    on_cycle(result)
             n += 1
             if cycles is not None and n >= cycles:
                 break
@@ -510,6 +521,23 @@ class TradingBot:
                 break
             time.sleep(max(0.0, interval))
         return out
+
+    def _record_cycle_failure(self, exc: Exception) -> None:
+        """Report a failing cycle once, not once per interval.
+
+        A venue that is unreachable stays unreachable for hours, and a full
+        traceback every fifteen seconds buries the one line that matters — the
+        endpoint — under thousands of identical ones. The first failure gets the
+        stack; repeats are counted silently and the count is reported when the
+        cycle finally succeeds. The dashboard shows the same thing: one error
+        row, one recovery row, not four hundred of either.
+        """
+        message = str(exc) or exc.__class__.__name__
+        self._cycles_since_error += 1
+        if message != self._cycle_error:
+            self._cycle_error = message
+            log.exception("cycle failed: %s", exc)
+            self._log("error", f"cycle failed: {message}")
 
     # ── status ─────────────────────────────────────────────────────────────
 

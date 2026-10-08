@@ -182,6 +182,51 @@ Points worth knowing:
   (`POST /api/control/reset_kill`, or `reset_kill_switch()`) clears it.
 * `demo.impact_scale` — the size of a headline's price impact. Lower it toward
   zero and the strategy should stop making money.
+* `feeds.testnet` / `broker.testnet` — run against sandbox endpoints. Either end
+  being a sandbox marks the whole run as one: `cfg.live` is then hard-wired
+  `false`, so a testnet process can never demand a live-money acknowledgement or
+  put a LIVE badge on the dashboard. The two default to each other, so a
+  half-sandboxed run (testnet prices, mainnet orders) has to be asked for.
+
+## Real prices, fake money (Binance testnet)
+
+`config/binance_testnet.toml` is the whole setup — Binance testnet candles, live
+RSS headlines, the paper broker, and **unchanged risk limits**:
+
+```bash
+export BINANCE_API_KEY=...      # https://testnet.binance.vision — no real money
+export BINANCE_API_SECRET=...
+export BINANCE_TESTNET=true
+
+jevbot doctor --config config/binance_testnet.toml   # fetches a ticker, cross-checks it
+jevbot run    --config config/binance_testnet.toml   # paper fills on real prices
+```
+
+`doctor` names the endpoint it is about to use (`https://testnet.binance.vision/api/v3`)
+and compares a freshly built snapshot against the venue's own ticker, so a feed
+that silently fell back to a generator — or to the wrong network — is caught
+before an order is sized off it. Any of `JEVBOT_BROKER_TESTNET`,
+`JEVBOT_FEED_TESTNET`, or `BINANCE_TESTNET` sets the same flags, and `.env` is
+read at startup (see `.env.example`); a real environment variable wins over the
+file.
+
+The testnet keys are sandbox credentials: they can move fake balances, not real
+ones. Because the broker stays `paper`, they are not needed for fills at all —
+prices are fetched from the public endpoints and orders are filled locally at
+those prices minus slippage. Switch `[broker] kind = "ccxt"` to route the same
+orders to the testnet matching engine instead.
+
+Two caveats that matter more than the setup:
+
+* **Testnet is not a preview of mainnet.** Its book is thin and its prices can
+  diverge from the real venue; a fill you would never get on mainnet looks
+  perfectly ordinary here. That is why this profile quotes more slippage than
+  the default, and why nothing in this README's performance table was produced
+  from it.
+* **A paper fill is still a paper fill.** Real prices do not make simulated
+  fills real: no queue position, no partial fills, no funding, no borrow, no
+  rejected order that would have been rejected. The engine's edge here has still
+  never been tested against a matching engine that can say no.
 
 ## Live mode
 
@@ -196,7 +241,9 @@ jevbot run
 
 The adapters refuse to construct without credentials, the bot refuses to start
 in live mode without the acknowledgement variable, and `broker.live` is shown on
-the dashboard so a paper run can never be mistaken for a live one. Live orders
+the dashboard so a paper run can never be mistaken for a live one. The
+acknowledgement is required for mainnet only, and it is unreachable from a
+testnet config: sandbox runs are `live = false` by construction. Live orders
 are also gated by the same risk governor, the same turnover cap, and the same
 kill switch as the backtest.
 
@@ -216,13 +263,14 @@ jevbot/
   portfolio.py    the book: average cost, exact cash, two-phase fills
   brokers/        paper (default), ccxt, alpaca — one interface
   feeds/          synthetic demo, jsonl replay, ccxt/alpaca/csv prices, rss/webhook news
+  venues.py       shared ccxt plumbing: exchange construction, endpoint naming, testnet detection
   store.py        SQLite: every decision, order and fill, joinable back to its headline
   metrics.py      performance, calibration (Brier/ECE), rank IC, direction accuracy
   backtest.py     drives the live loop on a handed-in clock + the falsification control
   server.py       the dashboard's JSON API and static files
   web/            the dashboard (no framework, no build step)
 scripts/          gen_data.py, backtest.py, eval_engine.py
-tests/            132 tests: the book, the planner, the governor, the metrics, the API
+tests/            180 tests: the book, the planner, the governor, the metrics, the API
 ```
 
 ## Testing
@@ -231,13 +279,23 @@ tests/            132 tests: the book, the planner, the governor, the metrics, t
 pip install -e ".[dev]" && pytest -q
 ```
 
-The suite runs entirely offline: no network, no GPU, no API keys. It is written
-around the failures that actually cost time here — a quantity passed where a
+The suite runs entirely offline: no network, no GPU, no API keys — the events
+handlers in `tests/test_live_venue_integration.py` are the one exception, and
+they talk to a local HTTP server instead of a venue, through a real `ccxt`
+client so the request paths and response parsing are the production ones. It is
+written around the failures that actually cost time here — a quantity passed where a
 notional was expected (a fill that is small, wrong, and perfectly plausible), a
 fill that debits cash without writing a position, dust that re-arms a close
 forever, wall-clock timestamps leaking into a replay, a warmup longer than the
-history producing a full report of zeros, and a broker bound to a different
-portfolio than the bot.
+history producing a full report of zeros, a broker bound to a different
+portfolio than the bot, and a side passed as a plain string (equal to `Side.BUY`
+but not identical to it, so a buy filled below the mid).
+
+Two of those were found by the venue test above rather than by reading the code:
+the live candle feed re-fed its whole window on every poll — which the feature
+engine correctly rejects as out-of-order, so the second cycle of any real run
+failed — and the spot exchange client was loading futures markets too, so an
+unreachable derivatives endpoint took spot pricing down with it.
 
 ## Known limitations
 

@@ -18,6 +18,10 @@ __all__ = ["Broker", "BrokerError", "LiveTradingRefused", "PaperBroker", "build_
 def build_broker(cfg, portfolio: Portfolio, *, force_paper: bool = False) -> Broker:
     """Build the configured broker; anything but ``paper`` needs acknowledgement."""
     kind = "paper" if force_paper else cfg.broker_kind
+    if force_paper and cfg.testnet:
+        # `--mode paper` with broker.testnet: keep the venue connection but do
+        # not route orders to it. The price feed is unaffected either way.
+        log.info("--mode paper: order routing stays local; the testnet endpoint is not used")
     if kind == "paper":
         b = cfg.section("broker")
         return PaperBroker(
@@ -33,9 +37,11 @@ def build_broker(cfg, portfolio: Portfolio, *, force_paper: bool = False) -> Bro
         env = os.environ
         return CCXTBroker(
             portfolio,
-            exchange_id=env.get("JEVBOT_CCXT_EXCHANGE", "binance"),
+            exchange_id=(cfg.get("feeds", "ccxt_exchange", default=None)
+                         or env.get("JEVBOT_CCXT_EXCHANGE", "binance")),
             api_key=env.get("BINANCE_API_KEY", env.get("JEVBOT_CCXT_KEY", "")),
             api_secret=env.get("BINANCE_API_SECRET", env.get("JEVBOT_CCXT_SECRET", "")),
+            testnet=cfg.testnet,
         )
     if kind == "alpaca":
         from .alpaca_broker import AlpacaBroker

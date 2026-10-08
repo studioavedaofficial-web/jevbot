@@ -1,10 +1,18 @@
-"""Live crypto broker via ccxt (Binance, Coinbase, Kraken, ...).
+"""Crypto broker via ccxt (Binance, Coinbase, Kraken, ...), live or testnet.
 
-Guarded by two independent conditions, because "I forgot which config I was on"
-is the most expensive mistake in this whole repository:
+Two endpoint families, and the guard depends on which one is in use:
 
-1. ``broker.kind = "ccxt"`` in config (never the default), **and**
-2. ``JEVBOT_I_UNDERSTAND_LIVE_RISK=yes`` in the environment.
+* **Testnet / sandbox** (``testnet = true``) — ``set_sandbox_mode(True)`` points
+  every REST and WebSocket URL at the venue's sandbox. No real money can move,
+  so this needs no acknowledgement and reports ``live: false``. This is the mode
+  to use for "real market data, fake fills".
+* **Real money** — needs *two* independent conditions, because "I forgot which
+  config I was on" is the most expensive mistake in this whole repository:
+  ``broker.kind = "ccxt"`` (never the default) **and**
+  ``JEVBOT_I_UNDERSTAND_LIVE_RISK=yes`` in the environment.
+
+The distinction is enforced by a property rather than by remembering to set a
+flag: ``is_live`` is hard-wired off whenever the sandbox is on.
 
 Orders are market orders by default. Every submit re-reads the exchange's own
 fill rather than assuming the requested quantity executed, and
@@ -14,13 +22,17 @@ local book cannot drift away from the venue's.
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from typing import Any
 
 from ..portfolio import Portfolio
 from ..types import Fill, MarketSnapshot, Order, Side
+from ..venues import CCXTUnavailable, build_ccxt_exchange, rest_endpoint
 from .base import Broker, BrokerError, LiveTradingRefused
+
+log = logging.getLogger(__name__)
 
 
 class CCXTBroker(Broker):
@@ -34,42 +46,47 @@ class CCXTBroker(Broker):
         api_key: str = "",
         api_secret: str = "",
         password: str = "",
-        sandbox: bool = False,
+        testnet: bool = False,
         acknowledged: bool | None = None,
         params: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(portfolio)
-        ack = (
-            os.environ.get("JEVBOT_I_UNDERSTAND_LIVE_RISK", "").strip().lower() == "yes"
-            if acknowledged is None else acknowledged
-        )
-        if not ack:
-            raise LiveTradingRefused(
-                "live crypto trading refused: set JEVBOT_I_UNDERSTAND_LIVE_RISK=yes to confirm "
-                "you intend to trade real money, or run with --mode paper"
+        if not testnet:
+            ack = (
+                os.environ.get("JEVBOT_I_UNDERSTAND_LIVE_RISK", "").strip().lower() == "yes"
+                if acknowledged is None else acknowledged
             )
-        try:
-            import ccxt
-        except ImportError as exc:  # pragma: no cover - optional dependency
-            raise BrokerError("ccxt is not installed (pip install 'jevbot[crypto]')") from exc
-        if not hasattr(ccxt, exchange_id):
-            raise BrokerError(f"unknown ccxt exchange id: {exchange_id!r}")
-
+            if not ack:
+                raise LiveTradingRefused(
+                    "live crypto trading refused: set JEVBOT_I_UNDERSTAND_LIVE_RISK=yes to "
+                    "confirm you intend to trade real money, or run against the sandbox with "
+                    "broker.testnet = true, or run with --mode paper"
+                )
         self.exchange_id = exchange_id
         self.params = dict(params or {})
-        self.exchange = getattr(ccxt, exchange_id)(
-            {"apiKey": api_key, "secret": api_secret, "password": password or None,
-             "enableRateLimit": True, "options": {"defaultType": "spot"}}
-        )
-        if sandbox and hasattr(self.exchange, "set_sandbox_mode"):
-            self.exchange.set_sandbox_mode(True)
+        self.testnet = bool(testnet)
+        try:
+            self.exchange = build_ccxt_exchange(
+                exchange_id, api_key=api_key, api_secret=api_secret, password=password,
+                testnet=self.testnet,
+            )
+        except CCXTUnavailable as exc:
+            raise BrokerError(str(exc)) from exc
         self.markets_loaded = False
+
+    # ── provenance ─────────────────────────────────────────────────────────
+
+    @property
+    def rest_endpoint(self) -> str:
+        """The URL orders will actually go to — shown in the dashboard and logs."""
+        return rest_endpoint(self.exchange)
 
     # ── interface ──────────────────────────────────────────────────────────
 
     @property
     def is_live(self) -> bool:
-        return True
+        """Testnet is not live: it cannot move real money, so it must not claim to."""
+        return not self.testnet
 
     def can_short(self) -> bool:
         return False  # spot by default; shorts need a margin/futures adapter
@@ -85,13 +102,17 @@ class CCXTBroker(Broker):
                 order.symbol, "market", side, order.qty, None, self.params or None
             )
             self.orders_sent += 1
-            return self._to_fill(order, raw)
+            return self._to_fill(order, raw, ts)
         except Exception as exc:  # pragma: no cover - network
             self.orders_rejected += 1
             self.last_error = str(exc)
+            # A rejection and a bug look the same from the caller's side, so the
+            # traceback has to land somewhere: a NameError here once turned every
+            # order into a "rejection" with a one-line message and no stack.
+            log.exception("ccxt order failed for %s", order.symbol)
             raise BrokerError(f"order rejected for {order.symbol}: {exc}") from exc
 
-    def _to_fill(self, order: Order, raw: dict[str, Any]) -> Fill | None:
+    def _to_fill(self, order: Order, raw: dict[str, Any], ts: float | None = None) -> Fill | None:
         filled = float(raw.get("filled") or raw.get("amount") or order.qty)
         price = float(raw.get("average") or raw.get("price") or 0.0)
         if not price or not filled:
@@ -138,8 +159,10 @@ class CCXTBroker(Broker):
     def info(self) -> dict[str, Any]:
         return {
             "broker": self.name,
-            "live": True,
+            "live": self.is_live,
+            "testnet": self.testnet,
             "exchange": self.exchange_id,
+            "endpoint": self.rest_endpoint,
             "orders_sent": self.orders_sent,
             "orders_rejected": self.orders_rejected,
             "last_error": self.last_error,

@@ -1,0 +1,53 @@
+# Binance testnet profile: real market data, fake money.
+#
+#   jevbot run --config config/binance_testnet.toml
+#
+# What changes versus the default config, and what deliberately does not:
+#
+#   price feed  → Binance testnet candles (testnet.binance.vision), so prices
+#                 are the venue's own rather than a generator's
+#   news feed   → live RSS headlines, routed by keyword against the universe
+#   broker      → paper. Fills are simulated locally; nothing reaches a venue,
+#                 testnet included. Set `[broker] kind = "ccxt"` to send orders
+#                 to the testnet matching engine instead (still fake money).
+#   risk        → unchanged. Same limits, same stops, same turnover cap.
+#
+# The universe is crypto-only because that is what the venue lists. Equities
+# (AAPL/NVDA/SPY) stay in the default config's universe and would only ever
+# produce "no snapshot" drops on a crypto venue.
+
+[feeds]
+price = "ccxt"
+news = "rss"
+ccxt_exchange = "binance"
+testnet = true
+
+[broker]
+kind = "paper"
+testnet = true
+# A touch more slippage than the default: the testnet order book is thin and
+# quoting it as if it were Binance mainnet would flatter every fill.
+slippage_bps = 5.0
+half_spread_bps = 3.0
+
+# Crypto only. `/USDT` pairs as Binance names them.
+[[universe.instruments]]
+symbol = "BTC/USDT"
+market = "crypto"
+name = "Bitcoin"
+
+[[universe.instruments]]
+symbol = "ETH/USDT"
+market = "crypto"
+name = "Ethereum"
+
+[[universe.instruments]]
+symbol = "SOL/USDT"
+market = "crypto"
+name = "Solana"
+
+[loop]
+# Real feeds arrive in real time: every 15s is plenty, and the news feed is the
+# only thing that changes between cycles.
+cycle_seconds = 15.0
+bar_seconds = 60

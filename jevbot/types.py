@@ -182,6 +182,19 @@ class Order:
     reason: str = ""
     client_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
 
+    def __post_init__(self) -> None:
+        """Normalise `side` at the boundary.
+
+        `Side` is a `str` enum, so ``"buy"`` and ``Side.BUY`` hash and compare
+        equal — but the brokers test direction with ``order.side is Side.BUY``,
+        and a plain string fails that test while passing every equality check.
+        The result is not an error: it is an order that fills below the mid on
+        the way in and a stop that closes the wrong way. Coercing here makes the
+        `is` comparisons safe for callers that never imported the enum.
+        """
+        if not isinstance(self.side, Side):
+            self.side = Side(self.side)
+
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["side"] = self.side.value
@@ -198,6 +211,19 @@ class Fill:
     ts: float
     slippage: float = 0.0
     order_id: str = ""
+
+    def __post_init__(self) -> None:
+        """Normalise `side` at the boundary.
+
+        `Side` is a `str` enum, so ``"buy"`` and ``Side.BUY`` hash and compare
+        equal — but the brokers test direction with ``order.side is Side.BUY``,
+        and a plain string fails that test while passing every equality check.
+        The result is not an error: it is an order that fills below the mid on
+        the way in and a stop that closes the wrong way. Coercing here makes the
+        `is` comparisons safe for callers that never imported the enum.
+        """
+        if not isinstance(self.side, Side):
+            self.side = Side(self.side)
 
     @property
     def notional(self) -> float:

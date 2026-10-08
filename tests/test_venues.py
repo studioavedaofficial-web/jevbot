@@ -291,6 +291,101 @@ def test_a_dead_rss_source_does_not_take_the_bot_down(fake):
     assert feed.poll() == []
 
 
+# ── a silent news feed is the failure nobody can see ────────────────────────
+# "No headlines" and "no headlines arriving" look identical on every panel an
+# operator has, and only one of them is fine. The feed has to say which it is.
+
+
+def test_a_dead_rss_source_reports_why_it_is_dead(fake):
+    feed = RSSNewsFeed(["https://unreachable.invalid/feed.xml"], timeout=0.5)
+    assert feed.poll() == []
+    info = feed.info()
+    assert info["ok"] is False
+    assert info["errors"], "the reason must survive the poll that failed"
+    assert "unreachable.invalid" in info["errors"][0]
+    assert "no headlines are arriving" in info["status"], info["status"]
+    # and the per-source record keeps the detail, not just the summary
+    src = info["sources"][0]
+    assert src["ok"] is False and src["error"] and src["polls"] == 1
+
+
+def test_a_working_rss_source_reports_ok_and_counts_what_it_served(fake):
+    feed = RSSNewsFeed(["https://example.test/feed.xml"], timeout=0.5)
+    xml = (
+        "<rss><channel><title>Channel</title>"
+        "<item><title>Bitcoin ETF inflows hit a record</title>"
+        "<pubDate>Tue, 07 Oct 2026 10:00:00 GMT</pubDate>"
+        "<description>BTC rallied.</description></item>"
+        "</channel></rss>"
+    )
+
+    class Resp:
+        def read(self):
+            return xml.encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    import jevbot.feeds.live as live
+
+    original = live.urllib.request.urlopen
+    live.urllib.request.urlopen = lambda *a, **kw: Resp()
+    try:
+        items = feed.poll()
+    finally:
+        live.urllib.request.urlopen = original
+
+    assert len(items) == 1 and "Bitcoin ETF" in items[0].text
+    info = feed.info()
+    assert info["ok"] is True and info["errors"] == []
+    assert info["served"] == 1 and info["total"] == 1, "the counter the panel shows"
+    assert "1/1 sources ok" in info["status"]
+
+
+def test_one_dead_source_among_working_ones_is_still_reported(fake):
+    """Partial failure is the dangerous case: headlines still arrive, so
+    nothing looks wrong, but a third of the world is missing."""
+    feed = RSSNewsFeed(["https://dead.invalid/feed.xml", "https://good.test/feed.xml"],
+                       timeout=0.5)
+    xml = ("<rss><channel><title>C</title><item><title>ETH steady</title>"
+           "</item></channel></rss>")
+
+    class Resp:
+        def read(self):
+            return xml.encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    import jevbot.feeds.live as live
+
+    original = live.urllib.request.urlopen
+
+    def selective(url, *a, **kw):
+        # urlopen is handed a Request, not a string
+        target = getattr(url, "full_url", url)
+        if "dead.invalid" in target:
+            raise OSError("Connection refused")
+        return Resp()
+
+    live.urllib.request.urlopen = selective
+    try:
+        assert len(feed.poll()) == 1
+    finally:
+        live.urllib.request.urlopen = original
+
+    info = feed.info()
+    assert info["ok"] is True, "the feed as a whole is up"
+    assert len(info["errors"]) == 1 and "dead.invalid" in info["errors"][0]
+    assert "1/2 sources reachable" in info["status"], info["status"]
+
+
 def test_a_loopback_endpoint_is_not_a_real_exchange():
     """The smoke-order guard: a local server is not a way to reach real money."""
     from jevbot.venues import is_local_endpoint, is_testnet_endpoint

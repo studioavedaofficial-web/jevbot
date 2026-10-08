@@ -6,6 +6,8 @@ Everything here is about the seams: the bot must use the clock it is given
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from jevbot.feeds.base import FeedError, PriceFeed
@@ -184,3 +186,126 @@ def test_a_recovered_feed_says_so(cfg, market):
     recovered = [e for e in bot.events if e["kind"] == "ok"][0]
     assert "recovered after" in recovered["message"]
     assert bot._cycle_error == ""  # noqa: SLF001
+
+
+# ── the news feed must be visible even when prices are not ──────────────────
+# A price outage used to short-circuit the cycle before the news poll, which
+# made the news feed's health unobservable: "0 headlines" could mean "dead
+# source" or "never asked", and the panel showed the same 0 either way.
+
+
+class _DeadNews:
+    name = "dead-rss"
+
+    def info(self):
+        return {"feed": self.name, "ok": False, "served": 0, "total": 0,
+                "errors": ["https://feeds.example/x: URLError: timed out"],
+                "status": "0/1 sources reachable — no headlines are arriving; "
+                          "first failure: https://feeds.example/x: URLError: timed out"}
+
+    def poll(self, now=None):
+        return []
+
+
+def test_a_dead_news_feed_is_reported_once_not_once_per_cycle(cfg, market):
+    from jevbot.bot import TradingBot
+    from jevbot.engine import HeuristicEngine
+
+    feed = _FlakyFeed()
+    bot = TradingBot(cfg, engine=HeuristicEngine(), price_feed=feed, news_feed=_DeadNews())
+    bot.cycle()
+    errors = [e for e in bot.events if e["kind"] == "error"
+              and "not delivering headlines" in e["message"]]
+    assert len(errors) == 1, [e["message"] for e in errors]
+    assert "feeds.example" in errors[0]["message"]
+    assert bot.status()["news_ok"] is False
+
+    # still dead, still one row
+    for _ in range(5):
+        bot.cycle()
+    again = [e for e in bot.events if e["kind"] == "error"
+             and "not delivering headlines" in e["message"]]
+    assert len(again) == 1, "a repeated failure is not five failures"
+
+
+def test_news_is_polled_even_when_the_price_feed_returns_nothing(cfg, market):
+    """Text arrives on its own schedule; a price outage must not blind us to it."""
+    from jevbot.bot import TradingBot
+    from jevbot.engine import HeuristicEngine
+
+    class Silent(_FlakyFeed):
+        def snapshot(self, symbol, now=None):
+            return None
+
+    class CountingNews:
+        name = "counting"
+
+        def __init__(self):
+            self.polls = 0
+
+        def info(self):
+            return {"feed": self.name, "ok": True}
+
+        def poll(self, now=None):
+            self.polls += 1
+            return []
+
+    price, news = Silent(), CountingNews()
+    bot = TradingBot(cfg, engine=HeuristicEngine(), price_feed=price, news_feed=news)
+    result = bot.cycle()
+    assert news.polls == 1, "the news feed was skipped because prices were missing"
+    assert result.decisions == 0 and result.orders == 0
+    warns = [e for e in bot.events if e["kind"] == "warn"]
+    assert len(warns) == 1, "the missing tape is reported once, not per cycle"
+
+
+def test_a_recovered_news_feed_says_so(cfg, market):
+    from jevbot.bot import TradingBot
+    from jevbot.engine import HeuristicEngine
+
+    class Flapping:
+        name = "flap"
+
+        def __init__(self):
+            self.ok = False
+
+        def info(self):
+            return {"feed": self.name, "ok": self.ok,
+                    "status": "1/1 sources ok" if self.ok else "0/1 sources reachable"}
+
+        def poll(self, now=None):
+            return []
+
+    news = Flapping()
+    bot = TradingBot(cfg, engine=HeuristicEngine(), price_feed=_FlakyFeed(), news_feed=news)
+    bot.cycle()
+    news.ok = True
+    bot.cycle()
+    kinds = [e["kind"] for e in bot.events]
+    assert kinds.count("error") == 1 and "ok" in kinds, kinds
+    assert bot.status()["news_ok"] is True
+
+
+def test_a_repeated_risk_drop_is_reported_once(cfg, market):
+    """A stale tape drops every symbol every cycle. The panel must survive it."""
+    from jevbot.bot import TradingBot
+    from jevbot.engine import HeuristicEngine
+    from jevbot.types import MarketSnapshot, Signal
+
+    bot = TradingBot(cfg, engine=HeuristicEngine(), price_feed=_FlakyFeed(),
+                     news_feed=_DeadNews())
+    # the test config starts at 100k; anchor to the equity we are going to pass,
+    # or the drawdown kill switch fires on the first cycle and there are no drops
+    bot.risk.anchor_equity(1_000.0)
+    stale = MarketSnapshot(symbol="BTC/USDT", ts=0.0, last=100.0)   # ancient
+    old = time.time() - 10_000.0
+    signal = Signal(symbol="BTC/USDT", ts=time.time(), score=0.9, target_weight=0.1)
+
+    for i in range(6):
+        # the age differs every cycle, which is what used to make each row unique
+        verdict = bot.risk.evaluate({"BTC/USDT": signal}, {"BTC/USDT": stale},
+                                    1_000.0, {}, old + i)
+        bot._log_risk_drops(verdict.dropped)  # noqa: SLF001
+    rows = [e for e in bot.events if e["kind"] == "risk-drop"]
+    assert len(rows) == 1, [r["message"] for r in rows]
+    assert "stale data" in rows[0]["message"]

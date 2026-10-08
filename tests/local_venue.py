@@ -101,15 +101,20 @@ class _Handler(BaseHTTPRequestHandler):
         self.server.seen.append((path, params))
         self.server.requests.append({"method": "GET", "path": path, "params": params})
 
+        shift = self.server.tape_shift
         if path.endswith("/exchangeInfo"):
-            return self._send({"timezone": "UTC", "serverTime": START_MS + N_BARS * BAR_MS,
+            return self._send({"timezone": "UTC",
+                               "serverTime": START_MS + N_BARS * BAR_MS + int(shift),
                                "rateLimits": [], "exchangeFilters": [],
                                "symbols": [self._symbol(s) for s in PRICES]})
         if path.endswith("/klines"):
             symbol = params.get("symbol", "")
             if symbol not in PRICES:
                 return self._send({"code": -1121, "msg": "Invalid symbol."}, 400)
-            return self._send(klines(symbol, int(params.get("limit", 500))))
+            rows = klines(symbol, int(params.get("limit", 500)))
+            if shift:
+                rows = [[int(r[0] + shift), *r[1:]] for r in rows]
+            return self._send(rows)
         if path.endswith("/ticker/24hr") or path.endswith("/ticker/price"):
             symbol = params.get("symbol", "")
             price = closes(symbol)[-1]
@@ -117,7 +122,7 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._send({"symbol": symbol, "price": f"{price:.2f}"})
             return self._send({"symbol": symbol, "lastPrice": f"{price:.2f}",
                                "bidPrice": f"{price - 0.5:.2f}", "askPrice": f"{price + 0.5:.2f}",
-                               "closeTime": START_MS + N_BARS * BAR_MS})
+                               "closeTime": START_MS + N_BARS * BAR_MS + int(shift)})
         if path.endswith("/account"):
             ok, why = self._authorised(raw, params)
             self.server.signatures.append(ok)
@@ -211,7 +216,8 @@ class LocalVenue:
     api_secret = "local-venue-secret"
 
     def __init__(self, *, balances: dict[str, float] | None = None,
-                 slippage: float = 0.002, reject: tuple[int, str] | None = None) -> None:
+                 slippage: float = 0.002, reject: tuple[int, str] | None = None,
+                 tape_end_ts: float | None = None) -> None:
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
         self._server.daemon_threads = True
         self._server.seen = []          # (path, params) — order preserved
@@ -224,6 +230,15 @@ class LocalVenue:
         self._server.balances = dict(balances or {"USDT": 1_000.0, "BTC": 0.0, "ETH": 0.0})
         self._server.slippage = slippage
         self._server.reject = reject
+        # A tape frozen in 2023 is unusable for watching the bot *trade*: the
+        # risk governor's freshness gate correctly refuses to act on a snapshot
+        # that old, so every cycle is dropped for stale data. Tests that assert
+        # on exact bars keep the fixed tape; a live-ish run anchors the last bar
+        # to now.
+        self._server.tape_shift = 0.0
+        if tape_end_ts is not None:
+            last_open = START_MS + (N_BARS - 1) * BAR_MS
+            self._server.tape_shift = (float(tape_end_ts) - last_open / 1000.0) * 1000.0
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
 

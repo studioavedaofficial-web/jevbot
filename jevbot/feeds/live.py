@@ -11,6 +11,7 @@ in one place regardless of where the prices came from.
 from __future__ import annotations
 
 import json
+import logging
 import time
 import urllib.request
 from typing import Any, Iterable
@@ -19,6 +20,8 @@ from ..types import Instrument, MarketSnapshot, NewsItem
 from ..venues import CCXTUnavailable, build_ccxt_exchange, rest_endpoint
 from .base import FeedError, NewsFeed, PriceFeed
 from .features import RollingFeatures
+
+log = logging.getLogger(__name__)
 
 
 class CCXTPriceFeed(PriceFeed):
@@ -286,7 +289,15 @@ class CSVPriceFeed(PriceFeed):
 
 
 class RSSNewsFeed(NewsFeed):
-    """Headlines from one or more RSS/Atom feeds, deduplicated by title hash."""
+    """Headlines from one or more RSS/Atom feeds, deduplicated by title hash.
+
+    A news source that fails is *reported*, not skipped. That sounds obvious and
+    is not: the obvious implementation catches the network error and moves to the
+    next URL, which means a bot with three dead sources and a bot with three
+    working ones that had a quiet afternoon look exactly the same from every
+    panel an operator can see. "No headlines" and "no headlines arriving" are
+    different facts and only one of them is fine.
+    """
 
     name = "rss"
 
@@ -298,6 +309,13 @@ class RSSNewsFeed(NewsFeed):
         self.symbol_map = symbol_map or {}
         self.timeout = timeout
         self.seen: set[str] = set()
+        self.served = 0                         # items handed to the bot
+        self.total = 0                          # items parsed from the sources
+        self.last_ok: float | None = None
+        self.sources: dict[str, dict[str, Any]] = {
+            url: {"url": url, "ok": None, "error": "", "items": 0, "polls": 0, "last_ok": None}
+            for url in self.urls
+        }
 
     def _tag(self, xml: str, name: str) -> list[str]:
         import re
@@ -308,12 +326,23 @@ class RSSNewsFeed(NewsFeed):
     def poll(self, now: float | None = None) -> list[NewsItem]:
         out: list[NewsItem] = []
         for url in self.urls:
+            status = self.sources.setdefault(
+                url, {"url": url, "ok": None, "error": "", "items": 0, "polls": 0, "last_ok": None}
+            )
+            status["polls"] += 1
             try:
                 req = urllib.request.Request(url, headers={"User-Agent": "jevbot/0.1"})
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     xml = resp.read().decode("utf-8", errors="replace")
-            except Exception:  # pragma: no cover - network
+            except Exception as exc:  # pragma: no cover - network
+                status["ok"] = False
+                status["error"] = f"{type(exc).__name__}: {exc}"
+                log.warning("news source failed: %s (%s)", url, status["error"])
                 continue
+            status["ok"] = True
+            status["error"] = ""
+            status["last_ok"] = time.time()
+            self.last_ok = status["last_ok"]
             titles = self._tag(xml, "title")
             descriptions = self._tag(xml, "description")
             dates = self._tag(xml, "pubDate") or self._tag(xml, "updated")
@@ -332,15 +361,49 @@ class RSSNewsFeed(NewsFeed):
                     if token.lower() in text.lower():
                         symbols = tuple(syms)
                         break
+                status["items"] += 1
+                self.total += 1
                 out.append(
                     NewsItem(text=text, ts=ts, symbols=symbols, source="rss", url=url,
                              news_id=f"rss-{abs(hash(key)) % 10**10:010d}")
                 )
         out.sort(key=lambda n: n.ts)
+        self.served += len(out)
         return out
 
+    @property
+    def ok(self) -> bool:
+        """True when at least one source answered on the most recent poll."""
+        polled = [s for s in self.sources.values() if s["polls"]]
+        return any(s["ok"] for s in polled) if polled else True
+
+    @property
+    def errors(self) -> list[str]:
+        return [f"{s['url']}: {s['error']}" for s in self.sources.values() if s["error"]]
+
+    def status_line(self) -> str:
+        """One line an operator can act on."""
+        if not self.sources:
+            return "no sources configured"
+        good = [s for s in self.sources.values() if s["ok"]]
+        if len(good) == len(self.sources):
+            return f"{len(good)}/{len(self.sources)} sources ok"
+        first = self.errors[0] if self.errors else "unknown error"
+        return (f"{len(good)}/{len(self.sources)} sources reachable — "
+                f"no headlines are arriving; first failure: {first}")
+
     def info(self) -> dict[str, Any]:
-        return {"feed": self.name, "urls": self.urls, "seen": len(self.seen)}
+        return {
+            "feed": self.name,
+            "urls": self.urls,
+            "served": self.served,
+            "total": self.total,
+            "seen": len(self.seen),
+            "ok": self.ok,
+            "errors": self.errors,
+            "sources": list(self.sources.values()),
+            "status": self.status_line(),
+        }
 
 
 class WebhookNewsFeed(NewsFeed):

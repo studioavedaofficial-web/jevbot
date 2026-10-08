@@ -25,6 +25,7 @@ sequencing is where a trading system usually loses money.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
@@ -155,6 +156,9 @@ class TradingBot:
         self._consecutive_rejections = 0
         self.venue_stopped = False
         self.venue_stop_reason = ""
+        self._no_snapshot_at: float | None = None
+        self._news_ok = True
+        self._dropped_seen: dict[str, str] = {}
         self.events: list[dict[str, Any]] = []
         self.latest_snapshots: dict[str, MarketSnapshot] = {}
         self.latest_signals: dict[str, Signal] = {}
@@ -190,15 +194,17 @@ class TradingBot:
         now = self.now()
         result = CycleResult(ts=now, cycle=self.cycle_count + 1, equity=self.portfolio.equity())
 
-        # 1 ── tape
-        snapshots = self.price_feed.snapshots(self.symbols, now)
-        if not snapshots:
-            self._log("warn", "no market snapshots this cycle; skipping")
-            return result
-        self.latest_snapshots = snapshots
-
-        # 2 ── text
+        # 1 ── text
+        #
+        # Headlines are collected before the price check, and deliberately so.
+        # Text arrives on its own schedule and costs nothing to gather, and
+        # polling it behind the tape has two bad consequences: a price outage
+        # silently stops the bot from collecting the news it will need to make
+        # decisions the moment prices return, and the news feed's own health
+        # becomes invisible — an RSS source that has been dead for an hour looks
+        # identical to one that has simply had a quiet hour.
         fresh = self.news_feed.poll(now)
+        self._note_news_health()
         routed = self.router.route_many(fresh)
         for item, symbols, reason in routed:
             item.symbols = tuple(symbols)
@@ -211,6 +217,13 @@ class TradingBot:
         result.news = len(routed)
         if self.store and routed:
             self.store.record_news(routed)
+
+        # 2 ── tape
+        snapshots = self.price_feed.snapshots(self.symbols, now)
+        if not snapshots:
+            self._no_snapshot(now)
+            return result
+        self.latest_snapshots = snapshots
 
         # 3 ── decide
         requests = self._pending_requests(snapshots, now)
@@ -263,9 +276,7 @@ class TradingBot:
         result.notes = verdict.notes
         for note in verdict.notes:
             self._log("risk", note)
-        for symbol, reason in verdict.dropped.items():
-            if reason not in {"no signal, position to be closed"}:
-                self._log("risk-drop", f"{symbol}: {reason}")
+        self._log_risk_drops(verdict.dropped)
 
         # 7 ── execute
         if self.venue_stopped:
@@ -411,7 +422,16 @@ class TradingBot:
             note = (order.notes + " · ") if getattr(order, "notes", "") else ""
             if fill is not None:
                 fills.append(fill)
-                statuses.append((order, "filled", f"{note}@ {fill.price:.4f} fee {fill.fee:.4f}"))
+                # The venue's own order id goes in the row an operator reads.
+                # It is the one string that can be pasted into the exchange's
+                # order history to answer "did this really happen there?" — and
+                # the fill's own id is the *venue's*, not ours, so without this
+                # the two rows in the store cannot be joined at all.
+                venue_id = ""
+                if getattr(self.broker, "name", "") != "paper" and fill.order_id:
+                    venue_id = f" · venue order {fill.order_id}"
+                statuses.append((order, "filled",
+                                 f"{note}@ {fill.price:.4f} fee {fill.fee:.4f}{venue_id}"))
             else:
                 statuses.append((order, "accepted", f"{note}no immediate fill"))
         if self.store and statuses:
@@ -419,6 +439,59 @@ class TradingBot:
             if fills:
                 self.store.record_fills(fills)
         return fills
+
+    def _log_risk_drops(self, dropped: dict[str, str]) -> None:
+        """Report each symbol's reason for being dropped when it *changes*.
+
+        A stale tape drops every symbol every cycle, and the age in the reason
+        makes each message unique, so the obvious implementation fills the 400
+        entry event buffer with one fact — that the tape is stale — repeated
+        four hundred times, and pushes out everything else. Compare the reason
+        with its numbers stripped, and report the transition, not the timer.
+        """
+        current: dict[str, str] = {}
+        for symbol, reason in dropped.items():
+            if reason in {"no signal, position to be closed"}:
+                continue
+            kind = re.sub(r"\s*\([^)]*\)", "", reason).strip()
+            current[symbol] = kind
+            if self._dropped_seen.get(symbol) != kind:
+                self._log("risk-drop", f"{symbol}: {reason}")
+        self._dropped_seen = current
+
+    def _no_snapshot(self, now: float) -> None:
+        """Say the tape is missing once, not once per cycle.
+
+        The loop retries every few seconds; a venue that is down for an hour
+        would otherwise fill the 400-entry event buffer with one sentence and
+        push every other fact out of it.
+        """
+        if self._no_snapshot_at is not None and (now - self._no_snapshot_at) < 300:
+            return
+        self._no_snapshot_at = now
+        self._log("warn", "no market snapshots this cycle; skipping — the price feed "
+                          "is named in the panel above, and the reason is in the log")
+
+    def _note_news_health(self) -> None:
+        """Report a news feed that is reachable-but-empty or plainly broken.
+
+        Once per state change, not once per poll: the first failure is news, the
+        four hundredth is noise.
+        """
+        info = self.news_feed.info() if hasattr(self.news_feed, "info") else {}
+        if "ok" not in info:
+            return
+        ok = bool(info.get("ok"))
+        if ok == self._news_ok:
+            return
+        self._news_ok = ok
+        if ok:
+            self._log("ok", f"news feed recovered: {info.get('status', '')}")
+            return
+        self._log("error", f"news feed is not delivering headlines: "
+                           f"{info.get('status') or '; '.join(info.get('errors') or [])}")
+        for line in (info.get("errors") or [])[:3]:
+            self._log("error", f"news source: {line}")
 
     def _note_rejection(self, order: Order, exc: Exception) -> None:
         """Count rejections in a row and stop talking to a venue that keeps saying no."""
@@ -653,6 +726,7 @@ class TradingBot:
             "broker": self.broker.info() if hasattr(self.broker, "info") else {},
             "price_feed": self.price_feed.info(),
             "news_feed": self.news_feed.info(),
+            "news_ok": self._news_ok,
             "routing": self.router.info(),
             "portfolio": self.portfolio.to_dict(self.instruments),
             "risk": self.risk.status(self.portfolio.equity(), self.now()),

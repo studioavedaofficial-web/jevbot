@@ -334,3 +334,22 @@ def test_the_smoke_order_respects_the_order_size_cap(venue, capsys):
     assert "clamping" in out, out
     qty = float(venue.orders[0]["quantity"])
     assert qty * 30_898.5 <= 50.0 * 1.01, f"{qty} BTC is more than the cap allows"
+
+
+def test_the_venue_order_id_is_recorded_with_the_order(venue):
+    """The one string that can be checked against the exchange's own history."""
+    cfg = _cfg()
+    portfolio = Portfolio.fresh(1_000.0)
+    broker = build_broker(cfg, portfolio)
+    bot = TradingBot(cfg, engine=HeuristicEngine(), broker=broker, portfolio=portfolio,
+                     price_feed=_QuietFeed(), news_feed=_NoNews())
+    from jevbot.store import Store
+
+    store = Store(":memory:")
+    bot.store = store
+    bot.submit([Order(symbol="BTC/USDT", side=Side.BUY, qty=0.0005)], {"BTC/USDT": _snapshot()}, 1.0)
+    row = store.recent_orders(1)[0]
+    store.close()
+    assert row["status"] == "filled"
+    assert "venue order" in row["detail"], row["detail"]
+    assert venue.orders, "the order must have reached the venue"

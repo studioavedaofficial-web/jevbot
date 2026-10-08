@@ -89,6 +89,7 @@ function renderHeader() {
   const broker = bot.broker || {};
   const feed = bot.price_feed || {};
   const risk = bot.risk || {};
+  const news = bot.news_feed || {};
 
   const badges = [];
   // The single most important thing for an operator to see: where orders go.
@@ -138,6 +139,14 @@ function renderHeader() {
   if (bot.venue_stopped) {
     banner.push(`<b>Venue breaker tripped.</b> ${fmt.esc(bot.venue_stop_reason || '')} — ` +
       `no orders are being sent. Fix the cause, then press Reset breaker.`);
+  }
+  if (news.ok === false && news.status) {
+    banner.push(`<b>News feed is not delivering.</b> ${fmt.esc(news.status)}. ` +
+      `Nothing can be decided without headlines, so no orders will be sent.`);
+  } else if (news.ok === true && (news.served || 0) === 0 && (news.total || 0) === 0
+             && (news.sources || []).some(s => s.ok)) {
+    banner.push(`<b>News feed is connected but has delivered no headlines yet.</b> ` +
+      `Sources reachable, nothing parsed — the next poll is in a few seconds.`);
   }
   if (banner.length) {
     el('warnbar').classList.remove('hidden');
@@ -360,7 +369,8 @@ function renderEngine() {
     ['cache hit rate', engine.cache_hit_rate === undefined ? '—' : fmt.pct(engine.cache_hit_rate, 0, false)],
     ['confidence gate', engine.min_confidence_gate ?? 'off'],
     ['price feed', `${fmt.esc(feed.feed || '—')} ${feed.synthetic ? '(synthetic)' : ''}`],
-    ['news feed', `${fmt.esc(news.feed || '—')} · served ${fmt.int(news.served ?? 0)}/${fmt.int(news.total ?? 0)}`],
+    ['news feed', `${fmt.esc(news.feed || '—')} · served ${fmt.int(news.served ?? 0)}/${fmt.int(news.total ?? 0)}`
+      + (news.status ? `<div class="meta" style="color:${news.ok ? 'var(--muted)' : 'var(--warn)'};font-size:10px">${fmt.esc(news.status)}</div>` : '')],
     ['news routing', fmt.esc(routing.mode || '—')],
   ];
   const stats = routing.stats || {};
@@ -394,7 +404,7 @@ function renderOrders() {
       <td class="${o.side === 'buy' ? 'pos' : 'neg'}">${fmt.esc(o.side)}</td>
       <td class="num">${fmt.num(o.qty, 4)}</td>
       <td>${fmt.esc(o.reason)}</td>
-      <td>${fmt.esc(o.status)} <span style="color:var(--muted)">${fmt.esc((o.detail || '').slice(0, 26))}</span></td>
+      <td>${fmt.esc(o.status)} <span style="color:var(--muted)">${fmt.esc((o.detail || '').slice(0, 120))}</span></td>
     </tr>`).join('')}</tbody></table></div>`;
 }
 

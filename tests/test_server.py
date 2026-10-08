@@ -180,3 +180,24 @@ def test_a_missing_route_is_a_404(served):
     with pytest.raises(urllib.error.HTTPError) as exc:
         urllib.request.urlopen(base + "/api/nonsense", timeout=10)
     assert exc.value.code == 404
+
+
+def test_a_head_probe_gets_headers_not_a_501(served):
+    """Preview panels and proxies probe with HEAD before framing the page."""
+    base, _ = served
+    for path in ("/", "/api/state", "/api/health"):
+        req = urllib.request.Request(base + path, method="HEAD")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            assert resp.status == 200, f"HEAD {path} -> {resp.status}"
+            assert resp.headers.get("Content-Type")
+
+
+def test_head_is_not_a_backdoor_to_mutate_state(served):
+    base, bot = served
+    before = bot.status()["paused"]
+    req = urllib.request.Request(base + "/api/control/pause", method="HEAD")
+    try:
+        urllib.request.urlopen(req, timeout=10)
+    except urllib.error.HTTPError as exc:
+        assert exc.code in (404, 405)
+    assert bot.status()["paused"] is before, "HEAD must never change the bot's state"

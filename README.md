@@ -270,7 +270,7 @@ jevbot/
   server.py       the dashboard's JSON API and static files
   web/            the dashboard (no framework, no build step)
 scripts/          gen_data.py, backtest.py, eval_engine.py
-tests/            180 tests: the book, the planner, the governor, the metrics, the API
+tests/            182 tests: the book, the planner, the governor, the metrics, the API
 ```
 
 ## Testing

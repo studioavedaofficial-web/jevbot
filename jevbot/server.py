@@ -143,7 +143,8 @@ class DashboardServer:
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
-                self.wfile.write(body)
+                if not getattr(self, "_head_only", False):
+                    self.wfile.write(body)
 
             def _send_file(self, path: Path) -> None:
                 if not path.exists():
@@ -156,7 +157,8 @@ class DashboardServer:
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
-                self.wfile.write(body)
+                if not getattr(self, "_head_only", False):
+                    self.wfile.write(body)
 
             def _query(self) -> tuple[str, dict[str, list[str]]]:
                 parsed = urlparse(self.path)
@@ -192,6 +194,19 @@ class DashboardServer:
 
             def do_GET(self) -> None:  # noqa: N802
                 self._dispatch("GET")
+
+            def do_HEAD(self) -> None:  # noqa: N802
+                """HEAD gets the same status and headers, minus the body.
+
+                Proxies and preview panels probe with HEAD before framing the
+                page. Answering 501 to that made a perfectly healthy dashboard
+                look like a broken one.
+                """
+                self._head_only = True
+                try:
+                    self._dispatch("GET")
+                finally:
+                    self._head_only = False
 
             def do_POST(self) -> None:  # noqa: N802
                 self._dispatch("POST")
